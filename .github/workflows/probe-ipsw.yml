@@ -1,0 +1,81 @@
+name: probe-ipsw
+
+# Диагностика формата root-образа из iOS 6.1.4 (iPhone5,2). Ничего не архивируется
+# и не выкладывается: только лог. IPSW тянется с CDN Apple диапазонами, целиком
+# или частично, чтобы не жечь трафик и минуты.
+
+on:
+  workflow_dispatch:
+    inputs:
+      member:
+        description: имя участника IPSW внутри архива
+        default: 048-2944-001.dmg
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      IPSW_URL: https://secure-appldnld.apple.com/iOS6.1/091-3423.20130502.Tr3Lz/iPhone5,2_6.1.4_10B350_Restore.ipsw
+      IPSW_SHA256: 44d55c73fc7375449119cbf117b2ea3fb63a62422289f31823fe02190e43810b
+    steps:
+      - name: Deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip hfsprogs hfsplus file dmg2img cpio xxd
+          python3 -m pip install --break-system-packages remotezip
+      - name: Fetch one member from the IPSW by range
+        run: |
+          set -e
+          M="${{ inputs.member }}"
+          python3 -c "
+          import remotezip, sys
+          z = remotezip.RemoteZip('$IPSW_URL')
+          names = z.namelist()
+          print('members:', len(names))
+          for n in names:
+              print('  ', n, z.getinfo(n).file_size)
+          if '$M' in names:
+              z.extract('$M', '.')
+          "
+          ls -la
+          file "$M" || true
+          sha256sum "$M" | head -c 80; echo
+      - name: Try to open it as an HFS+ volume
+        run: |
+          set -x
+          M="${{ inputs.member }}"
+          head -c 64 "$M" | xxd | head -4
+          for off in 0 512 1024 2048 4096 8192; do
+            printf 'at %s: ' "$off"
+            dd if="$M" bs=1 skip=$off count=4 2>/dev/null | xxd -p
+          done
+          echo '--- dmg2img ---'
+          dmg2img -i "$M" -o plain.img 2>&1 | head -20 || true
+          file plain.img 2>/dev/null || true
+          echo '--- loop mount attempts ---'
+          sudo mkdir -p /mnt/r
+          for img in "$M" plain.img; do
+            [ -f "$img" ] || continue
+            for opts in "loop,ro" "loop,ro,force" "loop,ro,sb=0"; do
+              if sudo mount -o "$opts" -t hfsplus "$img" /mnt/r 2>/tmp/m.err; then
+                echo "MOUNTED $img with $opts"
+                ls /mnt/r
+                sudo du -sh /mnt/r/* 2>/dev/null | head -20
+                sudo ls -l /mnt/r/sbin/launchd /mnt/r/usr/lib/dyld 2>&1 | head
+                sudo ls -la /mnt/r/System/Library/Caches/com.apple.dyld/ 2>&1 | head
+                sudo umount /mnt/r
+                break 2
+              fi
+            done
+            cat /tmp/m.err
+          done
+          echo '--- raw scan for signatures ---'
+          python3 - <<'PY'
+          d = open('048-2944-001.dmg','rb').read(64*1024*1024)
+          i = d.find(b'H+')
+          print('H+ at', hex(i) if i >= 0 else 'not in first 64 MiB')
+          for sig in (b'koly', b'bad1', b'bvh', b'zlib'):
+              j = d.find(sig)
+              print(sig, hex(j) if j >= 0 else 'none')
+          PY
