@@ -136,9 +136,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-v2-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
+          # в ключ входит только дерево патчей: правка workflow иначе каждый раз
+          # обнуляет кэш и стоит холодных 7 минут
+          key: ccache-v3-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ env.TOPAZ_4K }}-${{ hashFiles('xnu/patches/**') }}
           restore-keys: |
-            ccache-v2-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
+            ccache-v3-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ env.TOPAZ_4K }}-
 
       - name: Build
         working-directory: dxb
