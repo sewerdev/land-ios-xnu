@@ -112,11 +112,13 @@ jobs:
           cat "$CCACHE_WRAP/clang"
           # the wrappers freeze a compiler path: prove it is the pinned toolchain
           # and not the runner default, otherwise host archives mix bitcode versions
-          CL=$(sed -n 's|^exec ccache \(.*\)/clang "\$@"$|\1|p' "$CCACHE_WRAP/clang")
+          # (xcrun reports the symlinked Xcode_15.4.app, DEVELOPER_DIR the real dir)
+          CL=$(cd "$(sed -n 's|^exec ccache \(.*\)/clang "\$@"$|\1|p' "$CCACHE_WRAP/clang")" && pwd -P)
+          DD=$(cd "$DEVELOPER_DIR" && pwd -P)
           echo "wrapper compiler dir: $CL"
           case "$CL" in
-            "$DEVELOPER_DIR"/*) ;;
-            *) echo "wrapper clang is outside pinned DEVELOPER_DIR" >&2; exit 1 ;;
+            "$DD"/*) ;;
+            *) echo "wrapper clang is outside pinned DEVELOPER_DIR ($DD)" >&2; exit 1 ;;
           esac
           "$CCACHE_WRAP/clang" --version | head -2
 
@@ -168,12 +170,17 @@ jobs:
         if: always()
         run: |
           mkdir -p out/kdk-libs
-          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+          # the KDK layout differs per Xcode; find the archives instead of guessing
+          # (an unmatched glob would leave a literal '*' in the file name, which
+          # upload-artifact rejects)
+          find /Library/Developer/KDKs -name 'lib*.a' 2>/dev/null > out/kdk-libs/libs.txt || true
+          cat out/kdk-libs/libs.txt
+          while read -r lib; do
             b=$(basename "$lib" .a)
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
             lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
-          done
+          done < out/kdk-libs/libs.txt
           ls -la out/kdk-libs
 
       - name: Collect
