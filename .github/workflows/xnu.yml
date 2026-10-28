@@ -48,9 +48,18 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Shim SDK name the build script expects
+      - name: Pin one Xcode for the whole pipeline
         run: |
-          XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          # DEVELOPER_DIR written here is inherited by every later step, so xcrun,
+          # xcodebuild and the clang baked into the ccache wrappers cannot drift
+          # apart (a clang 16 object inside a libtool 15 archive fails with
+          # "Invalid bitcode version Producer 1600 Reader 1500").
+          XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "pinning $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$XC/Contents/Developer"
+          sudo xcode-select -s "$XC"
           SDKdir="$XC/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs"
           echo "SDKs present:"; ls "$SDKdir" || true
           if [ ! -e "$SDKdir/MacOSX14.0.sdk" ]; then
@@ -59,11 +68,10 @@ jobs:
             sudo ln -sfn "$REAL" "$SDKdir/MacOSX14.0.sdk"
           fi
           ls -la "$SDKdir" | head -6
-      - name: Align Xcode with whatever is installed
-        run: |
-          XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
-          echo "using $XC"
-          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun -find clang
+          xcrun -find iig
+          clang --version | head -2
 
       - name: Fetch build script
         run: |
@@ -94,9 +102,6 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
-          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
-          sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
           mkdir -p "$CCACHE_WRAP"
@@ -105,14 +110,23 @@ jobs:
             chmod +x "$CCACHE_WRAP/$t"
           done
           cat "$CCACHE_WRAP/clang"
+          # the wrappers freeze a compiler path: prove it is the pinned toolchain
+          # and not the runner default, otherwise host archives mix bitcode versions
+          CL=$(sed -n 's|^exec ccache \(.*\)/clang "\$@"$|\1|p' "$CCACHE_WRAP/clang")
+          echo "wrapper compiler dir: $CL"
+          case "$CL" in
+            "$DEVELOPER_DIR"/*) ;;
+            *) echo "wrapper clang is outside pinned DEVELOPER_DIR" >&2; exit 1 ;;
+          esac
+          "$CCACHE_WRAP/clang" --version | head -2
 
       - name: Restore ccache
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
+          key: ccache-v2-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
           restore-keys: |
-            ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
+            ccache-v2-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
 
       - name: Build
         working-directory: dxb
@@ -129,9 +143,13 @@ jobs:
         run: |
           # Generated headers, config option headers, mig output and the patched
           # source: enough to re-run any single compile command from the log locally.
-          SDK=$(xcrun --sdk macosx --show-sdk-path)
           mkdir -p sdk-kernel-platform
-          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          for s in "$(xcrun --sdk macosx --show-sdk-path)" /Library/Developer/KDKs/*/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.sdk; do
+            P="$s/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+            if [ -d "$P" ]; then cp -R "$P" sdk-kernel-platform/; echo "platform headers from $s"; break; fi
+          done
+          # tar must not fail on a run that died before xnu compiled
+          mkdir -p dxb/build/xnu.obj dxb/fakeroot/usr/local/include dxb/xnu
           tar czf buildtree.tgz \
             --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
             --exclude='kernel.development.*' --exclude='.git' \
