@@ -12,6 +12,13 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+      topaz_4k:
+        description: 1 = build SWEET with 4 KiB pages (Cortex-A53 has no 16K granule)
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -32,6 +39,9 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # makedefs/MakeInc.def: 4K-сборка SWEET включается только TOPAZ_4K=1 в окружении
+  # (make берёт переменные из env); она же меняет ARM64_LINK_ADDR на компактный layout.
+  TOPAZ_4K: ${{ inputs.topaz_4k || '1' }}
   # ccache: xnu is ~2000 compiles; a patch usually changes a few of them
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_BASEDIR: ${{ github.workspace }}
