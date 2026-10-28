@@ -220,6 +220,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
+          name: xnu-kernel-gz
+          path: |
+            out/*.gz
+            out/SHA256SUMS
+          retention-days: 7
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
