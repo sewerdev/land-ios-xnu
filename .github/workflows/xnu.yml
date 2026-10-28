@@ -199,7 +199,12 @@ jobs:
           mkdir -p out
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          (cd out && shasum -a 256 kernel.*.sweet > SHA256SUMS) || true
+          # 62 МБ артефакт качается с GitHub ~40 минут; ядро в gzip -9 — 6-7 МБ,
+          # этого хватает для локального mkpayload/QEMU-цикла
+          for f in out/kernel.development.sweet out/kernel.development.sweet.unstripped; do
+            [ -f "$f" ] && gzip -9 -k -f "$f" && ls -la "$f.gz"
+          done
 
       - uses: actions/upload-artifact@v4
         if: always()
