@@ -1,0 +1,162 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 798f146..1ced4c1 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -63,7 +63,7 @@ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ # topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1)
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53 $(if $(filter 1,$(TOPAZ_4K)),-DTOPAZ_4K=1) $(if $(filter 1,$(LAND_GICV2)),-DLAND_GICV2=1)
+ 
+ 
+ #
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index cfeb976..376d5b1 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -90,4 +90,26 @@
+ #define ICC_SRE_SRE                             0x1
+ /* End of GICv3 register definitions */
+ 
++/*
++ * land (MSM8937) has a GICv2: qcom,msm-qgic2, distributor at 0x0B000000 and a
++ * per-CPU interface at 0x0B002000. Cortex-A53 is ARMv8.0 without FEAT_GICv3,
++ * so it implements none of the ICC_* CPU-interface system registers: an
++ * acknowledgement is an MMIO read of GICC_IAR and an EOI an MMIO write of
++ * GICC_EOIR, while group, priority and enable for INTID 0..31 go through the
++ * per-CPU banked distributor view, exactly like the Linux gicv2 driver.
++ * Enabled by LAND_GICV2=1 in the build environment.
++ */
++#define GICD_CTLR_ENABLEGRP1_NS     0x1     /* non-secure view: Group 1 enable */
++
++#define GICD_IGROUPR(n)             (0x080 + 4 * (n))
++#define GICD_ISENABLER(n)           (0x100 + 4 * (n))
++#define GICD_IPRIORITYR(n)          (0x400 + 4 * (n))
++
++#define GICC_CTLR                   0x000
++#define GICC_PMR                    0x004
++#define GICC_BPR                    0x008
++#define GICC_IAR                    0x00C
++#define GICC_EOIR                   0x010
++#define GICC_CTLR_ENABLE            0x1
++
+ #endif /* ! _PEXPERT_ARM64_SWEET_H */
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..2c3091c 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -50,6 +50,13 @@ _gic_write32(vm_offset_t addr, uint32_t value)
+ #define gicr_write32(offset, data) (_gic_write32(gicr_pe_base + (offset), (data)))
+ #define gicr_read64(offset) (_gic_read64(gicr_pe_base + (offset)))
+ 
++#if defined(LAND_GICV2)
++/* GICv2: the second reg pair of /arm-io/gic is this CPU's interface. */
++vm_offset_t pe_gicc_base;
++#define gicc_read32(offset) (_gic_read32(pe_gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(pe_gicc_base + (offset), (data)))
++#endif
++
+ static vm_offset_t
+ find_gicr_pe_base()
+ {
+@@ -143,6 +150,32 @@ pe_init_fiq()
+ 		gicr_size = gicr_size_prop;
+ 	}
+ 
++#if defined(LAND_GICV2)
++	pe_gicc_base = gicr_base;
++
++	/*
++	 * INTID 0..31 (SGI + PPI) live in banked distributor registers, one bank
++	 * per CPU interface, so every processor programs its own: Group 1 because
++	 * TrustZone owns Group 0, a priority, then the enable bits for the virtual
++	 * timer PPI and for the SGI used by cpu_signal_handler().
++	 */
++	uint32_t land_irqen = (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI);
++	gicd_write32(GICD_IGROUPR(0), gicd_read32(GICD_IGROUPR(0)) | land_irqen);
++	for (unsigned int i = 0; i < 8; i++) {
++		gicd_write32(GICD_IPRIORITYR(i), 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER(0), land_irqen);
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1_NS);
++
++	/* The CPU interface itself is MMIO here: no ICC_* registers to write. */
++	gicc_write32(GICC_BPR, 0);
++	gicc_write32(GICC_PMR, 0xFF);
++	gicc_write32(GICC_CTLR, GICC_CTLR_ENABLE);
++	kprintf("LAND GICv2: GICC %p vtimer INTID %u\n", (void *)pe_gicc_base,
++	    sweet_vtimer_intid);
++	return;
++#endif
++
+ 	// Find the redistributor for this processor
+ 	vm_offset_t gicr_pe_base = find_gicr_pe_base();
+ 
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..67ec163 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -40,6 +40,10 @@ void pe_init_fiq(void);
+ extern uint32_t sweet_vtimer_intid;
+ #endif
+ 
++#if defined(LAND_GICV2)
++extern vm_offset_t pe_gicc_base;
++#endif
++
+ #ifdef PRIVATE
+ /**
+  * One hot ids to distinquish between all supported serial devices
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a2a8c1b..7526bea 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1939,8 +1939,15 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if defined(LAND_GICV2)
++	extern unsigned long pe_gicc_base;	/* vm_offset_t, pexpert/arm/pe_fiq.c */
++	/* GICv2: reading GICC_IAR acknowledges, the EOI write deactivates. */
++	uint64_t iar = (*(volatile uint32_t *)(pe_gicc_base + GICC_IAR)) & 0x3FF;
++	uint32_t intid = (uint32_t)iar;
++#else
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1951,11 +1958,19 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
++		#if defined(LAND_GICV2)
++		*(volatile uint32_t *)(pe_gicc_base + GICC_EOIR) = (uint32_t)iar;
++		#else
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		#endif
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
++		#if defined(LAND_GICV2)
++		*(volatile uint32_t *)(pe_gicc_base + GICC_EOIR) = (uint32_t)iar;
++		#else
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		#endif
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1966,7 +1981,11 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
++		#if defined(LAND_GICV2)
++		*(volatile uint32_t *)(pe_gicc_base + GICC_EOIR) = (uint32_t)iar;
++		#else
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		#endif
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else

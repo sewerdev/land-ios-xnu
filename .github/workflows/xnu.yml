@@ -19,6 +19,13 @@ on:
         options:
           - "1"
           - "0"
+      land_gicv2:
+        description: 1 = GICv2 CPU interface (land/MSM8937 has no ICC_* sysregs)
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "0"
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -42,6 +49,8 @@ env:
   # makedefs/MakeInc.def: 4K-сборка SWEET включается только TOPAZ_4K=1 в окружении
   # (make берёт переменные из env); она же меняет ARM64_LINK_ADDR на компактный layout.
   TOPAZ_4K: ${{ inputs.topaz_4k || '1' }}
+  # патч 0160: land = GICv2, у Cortex-A53 нет ICC_* системных регистров GICv3
+  LAND_GICV2: ${{ inputs.land_gicv2 || '1' }}
   # ccache: xnu is ~2000 compiles; a patch usually changes a few of them
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_BASEDIR: ${{ github.workspace }}
@@ -205,7 +214,7 @@ jobs:
           # 62 МБ артефакт качается с GitHub ~40 минут; ядро в gzip -9 — 6-7 МБ,
           # этого хватает для локального mkpayload/QEMU-цикла
           for f in out/kernel.development.sweet out/kernel.development.sweet.unstripped; do
-            [ -f "$f" ] && gzip -9 -k -f "$f" && ls -la "$f.gz"
+            if [ -f "$f" ]; then gzip -9 -k -f "$f"; ls -la "$f.gz"; fi
           done
 
       - uses: actions/upload-artifact@v4
