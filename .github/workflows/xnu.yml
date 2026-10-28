@@ -48,6 +48,17 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - name: Shim SDK name the build script expects
+        run: |
+          XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          SDKdir="$XC/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs"
+          echo "SDKs present:"; ls "$SDKdir" || true
+          if [ ! -e "$SDKdir/MacOSX14.0.sdk" ]; then
+            REAL=$(ls -d "$SDKdir"/MacOSX14*.sdk 2>/dev/null | head -1)
+            echo "linking MacOSX14.0.sdk -> $REAL"
+            sudo ln -sfn "$REAL" "$SDKdir/MacOSX14.0.sdk"
+          fi
+          ls -la "$SDKdir" | head -6
       - name: Align Xcode with whatever is installed
         run: |
           XC=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
