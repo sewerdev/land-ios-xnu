@@ -1,0 +1,277 @@
+From 04e5244b572968f6376738be7e2fcbb18f6c399e Mon Sep 17 00:00:00 2001
+From: sewerdev <sewerdev@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:04:32 +0300
+Subject: [PATCH] land: eMMC (SDHCI) block reader for the iOS 16 APFS root
+
+---
+ pexpert/arm/land_sdhci.c | 258 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 258 insertions(+)
+ create mode 100644 pexpert/arm/land_sdhci.c
+
+diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
+new file mode 100644
+index 0000000..d0764f8
+--- /dev/null
++++ b/pexpert/arm/land_sdhci.c
+@@ -0,0 +1,258 @@
++/*
++ * land_sdhci.c - eMMC reads for the Redmi 3S (land, MSM8937) from the kernel.
++ *
++ * The read recipe below is the one verified on the phone from the iBoot-role
++ * shim (land-emmc23..26): HOSTCTL1 = 0x10 (ADMA2, 32-bit address), one-entry
++ * ADMA2 descriptor in register 0x058 with attr VALID|DATA|END, a single
++ * 512-byte block, and the block count also written to the vendor ARG2 register
++ * at HC+0x30.  Without ARG2 the controller accepts CMD17 and then never starts
++ * the data phase, which is what made every earlier read attempt look like a
++ * timeout.  XFERMODE 0x11 (DMA_EN|READ_MODE), timeout 0x0F, INTSTAT/ERSTAT
++ * cleared with 0xffff, completion polled on Transfer Complete.
++ *
++ * A failed attempt leaves this controller with every register reading zero, so
++ * each transfer starts with a command/data software reset and the clock and
++ * power setup is redone once before the first one.
++ *
++ * The root filesystem location lives in the ADT (land,root-lba / -bytes / -fs);
++ * mounting is the caller's job, this file only moves blocks.
++ */
++
++#include <stdint.h>
++#include <mach/vm_types.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++
++#define LAND_SDCC1_PHYS		0x07824900UL
++#define LAND_SDCC1_SIZE		0x2600
++
++#define SDHCI_BLKSIZE		0x04
++#define SDHCI_BLKCOUNT		0x06
++#define SDHCI_ARG		0x08
++#define SDHCI_XFERMODE		0x0C
++#define SDHCI_CMD		0x0E
++#define SDHCI_RESP		0x10
++#define SDHCI_PRESENT		0x24
++#define SDHCI_HOSTCTL1		0x28
++#define SDHCI_CLKCTL		0x2C
++#define SDHCI_TIMEOUT		0x2E
++#define SDHCI_SWRESET		0x2F
++#define SDHCI_ARG2		0x30
++#define SDHCI_POWER		0x29
++#define SDHCI_INTSTAT		0x30
++#define SDHCI_ERSTAT		0x32
++#define SDHCI_INTEN		0x34
++#define SDHCI_EREN		0x36
++#define SDHCI_CAPS		0x40
++#define SDHCI_ADMAADDR		0x58
++#define SDHCI_HCVER		0xFE
++
++#define SDHCI_ADMA_VALID	0x0001
++#define SDHCI_ADMA_END		0x0002
++#define SDHCI_ADMA_DATA		0x0020
++
++#define SDHCI_XFER_READ		0x0011		/* DMA_EN | READ_MODE */
++#define SDHCI_CMD_DATAPRES	(1u << 5)
++#define SDHCI_CMD_IDXCHK	(1u << 4)
++#define SDHCI_CMD_CRCCHK	(1u << 3)
++#define SDHCI_INT_CC		0x0001
++#define SDHCI_INT_TC		0x0002
++#define SDHCI_CMD_INHIBIT	0x0001
++#define SDHCI_DAT_INHIBIT	0x0002
++
++struct land_adma_desc {
++	uint16_t attr;
++	uint16_t len;
++	uint32_t addr;
++} __attribute__((aligned(64)));
++
++static vm_offset_t land_hc;
++static vm_offset_t land_gcc;
++static struct land_adma_desc land_desc __attribute__((aligned(64)));
++static unsigned int land_rca;
++static int land_ready;
++static int land_faults;
++
++static inline uint32_t io_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	return v;
++}
++
++static inline void io_wr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static inline uint16_t io_rd16(vm_offset_t base, uint32_t off)
++{
++	uint16_t v = *(volatile uint16_t *)(base + off);
++
++	__asm__ volatile("dsb sy" ::: "memory");
++	return v;
++}
++
++static inline void io_wr16(vm_offset_t base, uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static inline void io_wr8(vm_offset_t base, uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void land_cache_flush(void *p, size_t len)
++{
++	uintptr_t a = (uintptr_t)p & ~63ULL;
++	uintptr_t e = ((uintptr_t)p + len + 63) & ~63ULL;
++
++	for (; a < e; a += 64)
++		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++#define GCC_CMD_RCGR	0x42004
++#define GCC_CFG_RCGR	0x42008
++#define GCC_M		0x4200C
++#define GCC_N		0x42010
++#define GCC_D		0x42014
++#define GCC_APPS_CBCR	0x42018
++
++static void land_clock_on(void)
++{
++	uint32_t cfg;
++
++	io_wr32(land_gcc, GCC_M, 12);
++	io_wr32(land_gcc, GCC_N, 1);
++	io_wr32(land_gcc, GCC_D, 4);
++	cfg = io_rd32(land_gcc, GCC_CFG_RCGR);
++	cfg &= ~((0x7u << 8) | 0x1fu | (0x3u << 12));
++	cfg |= (0x2u << 12);			/* mode DUAL_EDGE */
++	io_wr32(land_gcc, GCC_CFG_RCGR, cfg);
++	io_wr32(land_gcc, GCC_CMD_RCGR, 1);
++	for (unsigned int i = 0; i < 1000000u; i++)
++		if (!(io_rd32(land_gcc, GCC_CMD_RCGR) & 1u))
++			break;
++	io_wr32(land_gcc, GCC_APPS_CBCR,
++	    io_rd32(land_gcc, GCC_APPS_CBCR) | 1u);
++
++	io_wr8(land_hc, SDHCI_POWER, 0x0F);
++	io_wr16(land_hc, SDHCI_CLKCTL, 0x0001);
++	for (unsigned int i = 0; i < 2000000u; i++)
++		if (io_rd16(land_hc, SDHCI_CLKCTL) & 0x0002u) {
++			io_wr16(land_hc, SDHCI_CLKCTL, 0x0005);
++			break;
++		}
++	io_wr16(land_hc, SDHCI_INTEN, 0xffff);
++	io_wr16(land_hc, SDHCI_EREN, 0xffff);
++}
++
++static int land_wait_bits(uint32_t off, uint16_t mask, uint16_t want,
++    unsigned int spins)
++{
++	for (unsigned int i = 0; i < spins; i++)
++		if ((io_rd16(land_hc, off) & mask) == want)
++			return 0;
++	return -1;
++}
++
++static int land_cmd(uint32_t idx, uint32_t arg, uint32_t flags)
++{
++	uint32_t cmdbits;
++
++	if (land_wait_bits(SDHCI_PRESENT, SDHCI_CMD_INHIBIT, 0, 2000000u))
++		return -1;
++	io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++	io_wr32(land_hc, SDHCI_ARG, arg);
++	cmdbits = (flags & 0xffu) | ((idx & 0x3fu) << 8);
++	io_wr16(land_hc, SDHCI_CMD, (uint16_t)cmdbits);
++	if (land_wait_bits(SDHCI_INTSTAT, SDHCI_INT_CC, SDHCI_INT_CC, 2000000u))
++		return -1;
++	if (idx == 7 || idx == 2 || idx == 3)
++		land_rca = (io_rd32(land_hc, SDHCI_RESP) >> 16) & 0xffffu;
++	return 0;
++}
++
++static int land_transfer(uint64_t lba, void *buf, unsigned int nblk)
++{
++	uint16_t st, er;
++
++	io_wr8(land_hc, SDHCI_SWRESET, 0x06);
++	for (unsigned int i = 0; i < 2000000u; i++)
++		if (!(io_rd16(land_hc, SDHCI_SWRESET + 0) & 0x00ffu))
++			break;
++	land_cache_flush(buf, (size_t)nblk * 512);
++	io_wr8(land_hc, SDHCI_HOSTCTL1, 0x10);		/* ADMA2, 32-bit */
++	io_wr8(land_hc, SDHCI_TIMEOUT, 0x0F);
++	land_desc.attr = SDHCI_ADMA_VALID | SDHCI_ADMA_DATA | SDHCI_ADMA_END;
++	land_desc.len = (uint16_t)(nblk * 512);
++	land_desc.addr = (uint32_t)(uintptr_t)buf;
++	land_cache_flush(&land_desc, sizeof(land_desc));
++	io_wr32(land_hc, SDHCI_ADMAADDR, (uint32_t)(uintptr_t)&land_desc);
++	io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++	io_wr16(land_hc, SDHCI_ERSTAT, 0xffff);
++	io_wr16(land_hc, SDHCI_BLKSIZE, 512);
++	io_wr16(land_hc, SDHCI_BLKCOUNT, (uint16_t)nblk);
++	io_wr32(land_hc, SDHCI_ARG2, nblk);
++	io_wr16(land_hc, SDHCI_XFERMODE, SDHCI_XFER_READ);
++	if (land_cmd(nblk > 1 ? 18 : 17, (uint32_t)lba,
++	    SDHCI_CMD_DATAPRES | SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
++		return -1;
++	for (unsigned int i = 0; i < 4000000u; i++) {
++		st = io_rd16(land_hc, SDHCI_INTSTAT);
++		er = io_rd16(land_hc, SDHCI_ERSTAT);
++		if (er & ~0x0000u)
++			return -2 - (int)(er & 0x0fffu);
++		if (st & SDHCI_INT_TC)
++			return 0;
++	}
++	return -1000;
++}
++
++int land_emmc_ready(void)
++{
++	if (!land_hc) {
++		land_hc = ml_io_map(LAND_SDCC1_PHYS, LAND_SDCC1_SIZE);
++		land_gcc = ml_io_map(0x01800000UL, 0x1000);
++		if (!land_hc || !land_gcc)
++			return 0;
++		land_clock_on();
++	}
++	return land_hc != 0;
++}
++
++/* Read nblk 512-byte blocks. Returns 0 on success, negative on failure. */
++int land_emmc_read(uint64_t lba, void *buf, unsigned int nblk)
++{
++	if (!land_emmc_ready())
++		return -1;
++	if (land_rca == 0) {
++		if (land_cmd(0, 0, 0))
++			return -2;
++		if (land_cmd(2, 0, SDHCI_CMD_CRCCHK))
++			return -3;
++		if (land_rca == 0)
++			return -4;
++	}
++	if (land_cmd(7, land_rca << 16, SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
++		return -5;
++	if (land_cmd(16, 512, SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
++		return -6;
++	if (land_transfer(lba, buf, nblk)) {
++		++land_faults;
++		land_rca = 0;			/* force a re-identify next time */
++		return -7;
++	}
++	return 0;
++}
++
++unsigned int land_emmc_faults(void)
++{
++	return (unsigned int)land_faults;
++}
+-- 
+2.43.0.windows.1
+
