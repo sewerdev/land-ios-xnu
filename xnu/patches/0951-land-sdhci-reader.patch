@@ -1,277 +1,580 @@
-From 04e5244b572968f6376738be7e2fcbb18f6c399e Mon Sep 17 00:00:00 2001
-From: sewerdev <sewerdev@users.noreply.github.com>
-Date: Thu, 29 Oct 2026 19:04:32 +0300
-Subject: [PATCH] land: eMMC (SDHCI) block reader for the iOS 16 APFS root
-
----
- pexpert/arm/land_sdhci.c | 258 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 258 insertions(+)
- create mode 100644 pexpert/arm/land_sdhci.c
+land: eMMC PIO reader, its registration and one boot-time probe
 
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..d0764f8
+index 0000000..2b09319
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,543 @@
 +/*
-+ * land_sdhci.c - eMMC reads for the Redmi 3S (land, MSM8937) from the kernel.
++ * land_sdhci.c - eMMC access for the Redmi 3S (land, MSM8937) from XNU.
 + *
-+ * The read recipe below is the one verified on the phone from the iBoot-role
-+ * shim (land-emmc23..26): HOSTCTL1 = 0x10 (ADMA2, 32-bit address), one-entry
-+ * ADMA2 descriptor in register 0x058 with attr VALID|DATA|END, a single
-+ * 512-byte block, and the block count also written to the vendor ARG2 register
-+ * at HC+0x30.  Without ARG2 the controller accepts CMD17 and then never starts
-+ * the data phase, which is what made every earlier read attempt look like a
-+ * timeout.  XFERMODE 0x11 (DMA_EN|READ_MODE), timeout 0x0F, INTSTAT/ERSTAT
-+ * cleared with 0xffff, completion polled on Transfer Complete.
++ * Every register sequence here is the one measured working on the phone from
++ * the iBoot-role shim (runs pio1/xnu3, journal in the dip partition):
 + *
-+ * A failed attempt leaves this controller with every register reading zero, so
-+ * each transfer starts with a command/data software reset and the clock and
-+ * power setup is redone once before the first one.
++ *   read  : BLKSIZE=512, BLKCOUNT=1, ARG2=1, XFERMODE=0x10 (SDHCI_TRNS_READ,
++ *           no DMA bit), CMD17, drain 128 words from BUFDATA on Buffer Read
++ *           Ready, finish on Transfer Complete.  Verified: INTSTAT=0x0002,
++ *           ERSTAT=0, first word of block 8389632 = "RUN=" (shim journal).
++ *   write : XFERMODE=0x02, CMD24, push 128 words on Buffer Write Ready, then
++ *           wait for Transfer Complete.  Verified by the shim journaling dip.
++ *   init  : VENDSPEC=0xA1C, core HC_MODE bits 0 and 13, SWRESET(cmd), clear
++ *           the ADMA bit of HOSTCTL1, SDCC1 RCG M=12 N=1 D=4 DUAL_EDGE with
++ *           the APPS clock on, POWER=0x0F, clock enable and wait for stable,
++ *           then CMD0/CMD1/CMD2/CMD3/CMD9/CMD7/CMD16.
 + *
-+ * The root filesystem location lives in the ADT (land,root-lba / -bytes / -fs);
-+ * mounting is the caller's job, this file only moves blocks.
++ * PIO rather than ADMA2 on purpose: ADMA2 wants a *physical* buffer address
++ * and so early in the boot a __DATA symbol is only a virtual one.
++ *
++ * A failed transfer leaves this controller reading zeros until the clock and
++ * card are re-initialised, so every entry point re-inits after a fault.
++ * Disable with the boot arg land_emmc=0.
 + */
 +
 +#include <stdint.h>
-+#include <mach/vm_types.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/protos.h>
++#include <pexpert/device_tree.h>
++#include <pexpert/arm/protos.h>
++#include <machine/machine_routines.h>
 +
-+extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++/* Repeated at the one external caller (pexpert/arm/pe_identify_machine.c)
++ * instead of editing a header another land patch already owns. */
++extern void land_emmc_probe(void);
++extern int land_emmc_ready(void);
++extern int land_emmc_read(uint64_t lba, void *buf, unsigned int nblk);
++extern int land_emmc_write(uint64_t lba, const void *buf, unsigned int nblk);
++extern uint64_t land_emmc_root_lba(void);
++extern uint64_t land_emmc_root_bytes(void);
++extern unsigned int land_emmc_faults(void);
 +
-+#define LAND_SDCC1_PHYS		0x07824900UL
-+#define LAND_SDCC1_SIZE		0x2600
++#define LAND_CORE_PHYS  0x07824000UL
++#define LAND_CORE_SIZE  0x2F00
++#define LAND_HC_OFF     0x900           /* SDHC registers at 0x07824900 */
 +
-+#define SDHCI_BLKSIZE		0x04
-+#define SDHCI_BLKCOUNT		0x06
-+#define SDHCI_ARG		0x08
-+#define SDHCI_XFERMODE		0x0C
-+#define SDHCI_CMD		0x0E
-+#define SDHCI_RESP		0x10
-+#define SDHCI_PRESENT		0x24
-+#define SDHCI_HOSTCTL1		0x28
-+#define SDHCI_CLKCTL		0x2C
-+#define SDHCI_TIMEOUT		0x2E
-+#define SDHCI_SWRESET		0x2F
-+#define SDHCI_ARG2		0x30
-+#define SDHCI_POWER		0x29
-+#define SDHCI_INTSTAT		0x30
-+#define SDHCI_ERSTAT		0x32
-+#define SDHCI_INTEN		0x34
-+#define SDHCI_EREN		0x36
-+#define SDHCI_CAPS		0x40
-+#define SDHCI_ADMAADDR		0x58
-+#define SDHCI_HCVER		0xFE
++#define LAND_GCC_PHYS   0x01800000UL
++#define LAND_GCC_SIZE   0x43000
++#define GCC_SDCC1_CMD   0x42004
++#define GCC_SDCC1_CFG   0x42008
++#define GCC_SDCC1_M     0x4200C
++#define GCC_SDCC1_N     0x42010
++#define GCC_SDCC1_D     0x42014
++#define GCC_SDCC1_APPS  0x42018
 +
-+#define SDHCI_ADMA_VALID	0x0001
-+#define SDHCI_ADMA_END		0x0002
-+#define SDHCI_ADMA_DATA		0x0020
++#define SDHCI_SDMA      0x00
++#define SDHCI_BLKSIZE   0x04
++#define SDHCI_BLKCOUNT  0x06
++#define SDHCI_ARG       0x08
++#define SDHCI_XFERMODE  0x0C
++#define SDHCI_CMD       0x0E
++#define SDHCI_RESP0     0x10
++#define SDHCI_RESP3     0x1C
++#define SDHCI_BUFDATA   0x20
++#define SDHCI_PRESENT   0x24
++#define SDHCI_HOSTCTL1  0x28
++#define SDHCI_POWER     0x29
++#define SDHCI_CLKCTL    0x2C
++#define SDHCI_TIMEOUT   0x2E
++#define SDHCI_SWRESET   0x2F
++#define SDHCI_INTSTAT   0x30
++#define SDHCI_ERSTAT    0x32
++#define SDHCI_INTEN     0x34
++#define SDHCI_EREN      0x36
++#define SDHCI_SIGEN     0x38
++#define SDHCI_ERSIGEN   0x3A
++#define SDHCI_CAPS      0x40
++#define SDHCI_VENDSPEC  0x10C
++#define CORE_HC_MODE    0x78            /* relative to the core base */
 +
-+#define SDHCI_XFER_READ		0x0011		/* DMA_EN | READ_MODE */
-+#define SDHCI_CMD_DATAPRES	(1u << 5)
-+#define SDHCI_CMD_IDXCHK	(1u << 4)
-+#define SDHCI_CMD_CRCCHK	(1u << 3)
-+#define SDHCI_INT_CC		0x0001
-+#define SDHCI_INT_TC		0x0002
-+#define SDHCI_CMD_INHIBIT	0x0001
-+#define SDHCI_DAT_INHIBIT	0x0002
++/* SDHCI_TRNS, the U-Boot/lk2nd layout: 0x01 DMA, 0x02 BLK_CNT_EN,
++ * 0x04 AUTO_CMD12, 0x08 AUTO_CMD23, 0x10 READ. */
++#define XFER_PIO_READ   0x10
++#define XFER_PIO_WRITE  0x02
 +
-+struct land_adma_desc {
-+	uint16_t attr;
-+	uint16_t len;
-+	uint32_t addr;
-+} __attribute__((aligned(64)));
++#define CMD_RSP136      0x01
++#define CMD_RSP48       0x02
++#define CMD_CRCCHK      0x08
++#define CMD_IDXCHK      0x10
++#define CMD_DATAPRES    0x20
 +
++#define INT_CMD_DONE    0x0001
++#define INT_XFER_DONE   0x0002
++#define INT_WR_READY    0x0010
++#define INT_RD_READY    0x0020
++
++#define SPIN_CMD        400000u
++#define SPIN_DATA       4000000u
++#define SPIN_RESET      1000000u
++
++/* dip is the diagnostic partition the shim journals into.  The kernel writes
++ * its own record 32 KiB further in so the two never overwrite each other. */
++#define LAND_DIP_LBA    8389632ULL
++#define LAND_JNL_LBA    (LAND_DIP_LBA + 64)
++#define JNL_MAGIC       "LANDK1"
++
++static vm_offset_t land_core;
 +static vm_offset_t land_hc;
 +static vm_offset_t land_gcc;
-+static struct land_adma_desc land_desc __attribute__((aligned(64)));
-+static unsigned int land_rca;
-+static int land_ready;
-+static int land_faults;
++static uint32_t land_rca;
++static int land_card_ready;
++static unsigned int land_faults;
++static uint64_t land_root_lba = 9700368ULL;
++static uint64_t land_root_bytes = 5635047424ULL;
 +
-+static inline uint32_t io_rd32(vm_offset_t base, uint32_t off)
++static inline uint32_t
++io_rd32(vm_offset_t base, uint32_t off)
 +{
-+	uint32_t v = *(volatile uint32_t *)(base + off);
++        uint32_t v = *(volatile uint32_t *)(base + off);
 +
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	return v;
++        __asm__ volatile("dsb sy" ::: "memory");
++        return v;
 +}
 +
-+static inline void io_wr32(vm_offset_t base, uint32_t off, uint32_t v)
++static inline void
++io_wr32(vm_offset_t base, uint32_t off, uint32_t v)
 +{
-+	*(volatile uint32_t *)(base + off) = v;
-+	__asm__ volatile("dsb sy" ::: "memory");
++        *(volatile uint32_t *)(base + off) = v;
++        __asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+static inline uint16_t io_rd16(vm_offset_t base, uint32_t off)
++static inline uint16_t
++io_rd16(vm_offset_t base, uint32_t off)
 +{
-+	uint16_t v = *(volatile uint16_t *)(base + off);
++        uint16_t v = *(volatile uint16_t *)(base + off);
 +
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	return v;
++        __asm__ volatile("dsb sy" ::: "memory");
++        return v;
 +}
 +
-+static inline void io_wr16(vm_offset_t base, uint32_t off, uint16_t v)
++static inline void
++io_wr16(vm_offset_t base, uint32_t off, uint16_t v)
 +{
-+	*(volatile uint16_t *)(base + off) = v;
-+	__asm__ volatile("dsb sy" ::: "memory");
++        *(volatile uint16_t *)(base + off) = v;
++        __asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+static inline void io_wr8(vm_offset_t base, uint32_t off, uint8_t v)
++static inline uint8_t
++io_rd8(vm_offset_t base, uint32_t off)
 +{
-+	*(volatile uint8_t *)(base + off) = v;
-+	__asm__ volatile("dsb sy" ::: "memory");
++        uint8_t v = *(volatile uint8_t *)(base + off);
++
++        __asm__ volatile("dsb sy" ::: "memory");
++        return v;
 +}
 +
-+static void land_cache_flush(void *p, size_t len)
++static inline void
++io_wr8(vm_offset_t base, uint32_t off, uint8_t v)
 +{
-+	uintptr_t a = (uintptr_t)p & ~63ULL;
-+	uintptr_t e = ((uintptr_t)p + len + 63) & ~63ULL;
-+
-+	for (; a < e; a += 64)
-+		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
-+	__asm__ volatile("dsb sy" ::: "memory");
++        *(volatile uint8_t *)(base + off) = v;
++        __asm__ volatile("dsb sy" ::: "memory");
 +}
 +
-+#define GCC_CMD_RCGR	0x42004
-+#define GCC_CFG_RCGR	0x42008
-+#define GCC_M		0x4200C
-+#define GCC_N		0x42010
-+#define GCC_D		0x42014
-+#define GCC_APPS_CBCR	0x42018
-+
-+static void land_clock_on(void)
++static void
++land_spin(unsigned int n)
 +{
-+	uint32_t cfg;
-+
-+	io_wr32(land_gcc, GCC_M, 12);
-+	io_wr32(land_gcc, GCC_N, 1);
-+	io_wr32(land_gcc, GCC_D, 4);
-+	cfg = io_rd32(land_gcc, GCC_CFG_RCGR);
-+	cfg &= ~((0x7u << 8) | 0x1fu | (0x3u << 12));
-+	cfg |= (0x2u << 12);			/* mode DUAL_EDGE */
-+	io_wr32(land_gcc, GCC_CFG_RCGR, cfg);
-+	io_wr32(land_gcc, GCC_CMD_RCGR, 1);
-+	for (unsigned int i = 0; i < 1000000u; i++)
-+		if (!(io_rd32(land_gcc, GCC_CMD_RCGR) & 1u))
-+			break;
-+	io_wr32(land_gcc, GCC_APPS_CBCR,
-+	    io_rd32(land_gcc, GCC_APPS_CBCR) | 1u);
-+
-+	io_wr8(land_hc, SDHCI_POWER, 0x0F);
-+	io_wr16(land_hc, SDHCI_CLKCTL, 0x0001);
-+	for (unsigned int i = 0; i < 2000000u; i++)
-+		if (io_rd16(land_hc, SDHCI_CLKCTL) & 0x0002u) {
-+			io_wr16(land_hc, SDHCI_CLKCTL, 0x0005);
-+			break;
-+		}
-+	io_wr16(land_hc, SDHCI_INTEN, 0xffff);
-+	io_wr16(land_hc, SDHCI_EREN, 0xffff);
++        for (unsigned int i = 0; i < n; i++) {
++                __asm__ volatile("" ::: "memory");
++        }
 +}
 +
-+static int land_wait_bits(uint32_t off, uint16_t mask, uint16_t want,
-+    unsigned int spins)
++/*
++ * The shim's do_cmd() verbatim: clear both status registers, launch, poll
++ * errors ahead of completion, acknowledge Command Complete, take the four
++ * response words.
++ */
++static int
++land_do_cmd(int idx, uint32_t arg, uint16_t flags, uint32_t *resp)
 +{
-+	for (unsigned int i = 0; i < spins; i++)
-+		if ((io_rd16(land_hc, off) & mask) == want)
-+			return 0;
-+	return -1;
++        io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++        io_wr16(land_hc, SDHCI_ERSTAT, 0xffff);
++        io_wr32(land_hc, SDHCI_ARG, arg);
++        io_wr16(land_hc, SDHCI_CMD, (uint16_t)((idx << 8) | flags));
++
++        for (unsigned int i = 0; i < SPIN_CMD; i++) {
++                uint16_t e = io_rd16(land_hc, SDHCI_ERSTAT);
++                uint16_t s = io_rd16(land_hc, SDHCI_INTSTAT);
++
++                if (e != 0) {
++                        io_wr16(land_hc, SDHCI_ERSTAT, e);
++                        io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++                        return -e;
++                }
++                if ((s & INT_CMD_DONE) != 0) {
++                        io_wr16(land_hc, SDHCI_INTSTAT, INT_CMD_DONE);
++                        if (resp != NULL) {
++                                resp[0] = io_rd32(land_hc, SDHCI_RESP0);
++                                resp[1] = io_rd32(land_hc, SDHCI_RESP0 + 4);
++                                resp[2] = io_rd32(land_hc, SDHCI_RESP0 + 8);
++                                resp[3] = io_rd32(land_hc, SDHCI_RESP3);
++                        }
++                        return 0;
++                }
++        }
++        return -999;
 +}
 +
-+static int land_cmd(uint32_t idx, uint32_t arg, uint32_t flags)
++static int
++land_card_init(void)
 +{
-+	uint32_t cmdbits;
++        uint32_t r[4] = { 0, 0, 0, 0 };
++        uint32_t cfg, hc1;
++        int rc;
 +
-+	if (land_wait_bits(SDHCI_PRESENT, SDHCI_CMD_INHIBIT, 0, 2000000u))
-+		return -1;
-+	io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
-+	io_wr32(land_hc, SDHCI_ARG, arg);
-+	cmdbits = (flags & 0xffu) | ((idx & 0x3fu) << 8);
-+	io_wr16(land_hc, SDHCI_CMD, (uint16_t)cmdbits);
-+	if (land_wait_bits(SDHCI_INTSTAT, SDHCI_INT_CC, SDHCI_INT_CC, 2000000u))
-+		return -1;
-+	if (idx == 7 || idx == 2 || idx == 3)
-+		land_rca = (io_rd32(land_hc, SDHCI_RESP) >> 16) & 0xffffu;
-+	return 0;
++        io_wr32(land_hc, SDHCI_VENDSPEC, 0xA1C);
++        io_wr32(land_core, CORE_HC_MODE, io_rd32(land_core, CORE_HC_MODE) | 1u);
++        io_wr32(land_core, CORE_HC_MODE,
++            io_rd32(land_core, CORE_HC_MODE) | (1u << 13));
++
++        io_wr8(land_hc, SDHCI_SWRESET, 1);
++        for (unsigned int i = 0; i < SPIN_RESET; i++) {
++                if ((io_rd8(land_hc, SDHCI_SWRESET) & 1) == 0) {
++                        break;
++                }
++        }
++
++        io_wr16(land_hc, SDHCI_INTEN, 0xffff);
++        io_wr16(land_hc, SDHCI_EREN, 0xffff);
++        io_wr16(land_hc, SDHCI_SIGEN, 0);
++        io_wr16(land_hc, SDHCI_ERSIGEN, 0);
++
++        /* The controller comes up in ADMA mode and would read the transfer
++         * address as a descriptor instead of waiting for FIFO service. */
++        hc1 = io_rd32(land_hc, SDHCI_HOSTCTL1);
++        io_wr32(land_hc, SDHCI_HOSTCTL1, hc1 & ~0x10u);
++
++        io_wr32(land_gcc, GCC_SDCC1_M, 12);
++        io_wr32(land_gcc, GCC_SDCC1_N, 1);
++        io_wr32(land_gcc, GCC_SDCC1_D, 4);
++        cfg = io_rd32(land_gcc, GCC_SDCC1_CFG);
++        cfg &= ~((0x7u << 8) | 0x1fu | (0x3u << 12));
++        cfg |= (0x2u << 12);                   /* DUAL_EDGE */
++        io_wr32(land_gcc, GCC_SDCC1_CFG, cfg);
++        io_wr32(land_gcc, GCC_SDCC1_CMD, 1);
++        for (unsigned int i = 0; i < SPIN_RESET; i++) {
++                if ((io_rd32(land_gcc, GCC_SDCC1_CMD) & 1u) == 0) {
++                        break;
++                }
++        }
++        io_wr32(land_gcc, GCC_SDCC1_APPS, io_rd32(land_gcc, GCC_SDCC1_APPS) | 1u);
++
++        io_wr8(land_hc, SDHCI_POWER, 0x0F);
++        io_wr8(land_hc, SDHCI_TIMEOUT, 0x0E);
++        io_wr16(land_hc, SDHCI_CLKCTL, 0x0001);
++        for (unsigned int i = 0; i < 2000000u; i++) {
++                if ((io_rd16(land_hc, SDHCI_CLKCTL) & 2u) != 0) {
++                        io_wr16(land_hc, SDHCI_CLKCTL, 0x0005);
++                        break;
++                }
++        }
++
++        if (land_do_cmd(0, 0, 0, NULL) != 0) {
++                return -1;
++        }
++        for (int i = 0; i < 50; i++) {
++                rc = land_do_cmd(1, 0x40FF8080u, CMD_RSP48, r);
++                if (rc == 0 && (r[0] & (1u << 31)) != 0) {
++                        break;
++                }
++                land_spin(200000u);             /* tens of milliseconds */
++                if (i == 49) {
++                        return -2;
++                }
++        }
++        if (((rc = land_do_cmd(2, 0, CMD_RSP136 | CMD_CRCCHK, r)) != 0) ||
++            ((rc = land_do_cmd(3, 0, CMD_RSP48 | CMD_CRCCHK | CMD_IDXCHK, r)) != 0)) {
++                return rc;
++        }
++        land_rca = r[0] >> 16;
++        rc = land_do_cmd(9, land_rca << 16, CMD_RSP136 | CMD_CRCCHK, r);
++        if (rc != 0) {
++                return rc;
++        }
++        rc = land_do_cmd(7, land_rca << 16, CMD_RSP48 | CMD_CRCCHK | CMD_IDXCHK, r);
++        if (rc != 0) {
++                return rc;
++        }
++        rc = land_do_cmd(16, 512, CMD_RSP48 | CMD_CRCCHK | CMD_IDXCHK, NULL);
++        land_card_ready = (rc == 0);
++        return rc;
 +}
 +
-+static int land_transfer(uint64_t lba, void *buf, unsigned int nblk)
++static int
++land_ready(void)
 +{
-+	uint16_t st, er;
++        if (land_hc == 0) {
++                land_core = ml_io_map(LAND_CORE_PHYS, LAND_CORE_SIZE);
++                land_gcc = ml_io_map(LAND_GCC_PHYS, LAND_GCC_SIZE);
++                if (land_core == 0 || land_gcc == 0) {
++                        return 0;
++                }
++                land_hc = land_core + LAND_HC_OFF;
++        }
++        if (!land_card_ready) {
++                if (land_card_init() != 0) {
++                        ++land_faults;
++                        return 0;
++                }
++        }
++        return 1;
++}
 +
-+	io_wr8(land_hc, SDHCI_SWRESET, 0x06);
-+	for (unsigned int i = 0; i < 2000000u; i++)
-+		if (!(io_rd16(land_hc, SDHCI_SWRESET + 0) & 0x00ffu))
-+			break;
-+	land_cache_flush(buf, (size_t)nblk * 512);
-+	io_wr8(land_hc, SDHCI_HOSTCTL1, 0x10);		/* ADMA2, 32-bit */
-+	io_wr8(land_hc, SDHCI_TIMEOUT, 0x0F);
-+	land_desc.attr = SDHCI_ADMA_VALID | SDHCI_ADMA_DATA | SDHCI_ADMA_END;
-+	land_desc.len = (uint16_t)(nblk * 512);
-+	land_desc.addr = (uint32_t)(uintptr_t)buf;
-+	land_cache_flush(&land_desc, sizeof(land_desc));
-+	io_wr32(land_hc, SDHCI_ADMAADDR, (uint32_t)(uintptr_t)&land_desc);
-+	io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
-+	io_wr16(land_hc, SDHCI_ERSTAT, 0xffff);
-+	io_wr16(land_hc, SDHCI_BLKSIZE, 512);
-+	io_wr16(land_hc, SDHCI_BLKCOUNT, (uint16_t)nblk);
-+	io_wr32(land_hc, SDHCI_ARG2, nblk);
-+	io_wr16(land_hc, SDHCI_XFERMODE, SDHCI_XFER_READ);
-+	if (land_cmd(nblk > 1 ? 18 : 17, (uint32_t)lba,
-+	    SDHCI_CMD_DATAPRES | SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
-+		return -1;
-+	for (unsigned int i = 0; i < 4000000u; i++) {
-+		st = io_rd16(land_hc, SDHCI_INTSTAT);
-+		er = io_rd16(land_hc, SDHCI_ERSTAT);
-+		if (er & ~0x0000u)
-+			return -2 - (int)(er & 0x0fffu);
-+		if (st & SDHCI_INT_TC)
-+			return 0;
++/*
++ * One 512-byte PIO transfer in either direction.  The 32-bit write to
++ * SDHCI_INTSTAT is also this controller's ARG2: without that block count the
++ * command is accepted and the data phase never starts.
++ */
++static int
++land_block(uint64_t lba, uint8_t *buf, int write)
++{
++        int words = 0;
++
++        io_wr8(land_hc, SDHCI_SWRESET, 0x06);
++        for (unsigned int i = 0; i < SPIN_RESET; i++) {
++                if ((io_rd8(land_hc, SDHCI_SWRESET) & 0x06) == 0) {
++                        break;
++                }
++        }
++        io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++        io_wr16(land_hc, SDHCI_ERSTAT, 0xffff);
++        io_wr16(land_hc, SDHCI_BLKSIZE, 512);
++        io_wr16(land_hc, SDHCI_BLKCOUNT, 1);
++        io_wr32(land_hc, SDHCI_INTSTAT, 1);     /* ARG2 alias */
++        io_wr16(land_hc, SDHCI_XFERMODE, write ? XFER_PIO_WRITE : XFER_PIO_READ);
++
++        if (land_do_cmd(write ? 24 : 17, (uint32_t)lba,
++            CMD_RSP48 | CMD_CRCCHK | CMD_IDXCHK | CMD_DATAPRES, NULL) != 0) {
++                ++land_faults;
++                land_card_ready = 0;
++                return -1;
++        }
++
++        for (unsigned int i = 0; i < SPIN_DATA; i++) {
++                uint16_t er = io_rd16(land_hc, SDHCI_ERSTAT);
++                uint16_t st = io_rd16(land_hc, SDHCI_INTSTAT);
++
++                if (er != 0) {
++                        ++land_faults;
++                        land_card_ready = 0;
++                        return -2 - (int)er;
++                }
++                if (write) {
++                        if ((st & INT_WR_READY) != 0 && words < 128) {
++                                while (words < 128) {
++                                        io_wr32(land_hc, SDHCI_BUFDATA,
++                                            (uint32_t)buf[words * 4] |
++                                            ((uint32_t)buf[(words * 4) + 1] << 8) |
++                                            ((uint32_t)buf[(words * 4) + 2] << 16) |
++                                            ((uint32_t)buf[(words * 4) + 3] << 24));
++                                        words++;
++                                }
++                                io_wr16(land_hc, SDHCI_INTSTAT, INT_WR_READY);
++                        }
++                        if (words >= 128 && (st & INT_XFER_DONE) != 0) {
++                                io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++                                return 0;
++                        }
++                } else {
++                        if ((st & INT_RD_READY) != 0 && words < 128) {
++                                while (words < 128) {
++                                        uint32_t v = io_rd32(land_hc, SDHCI_BUFDATA);
++                                        buf[words * 4] = (uint8_t)v;
++                                        buf[(words * 4) + 1] = (uint8_t)(v >> 8);
++                                        buf[(words * 4) + 2] = (uint8_t)(v >> 16);
++                                        buf[(words * 4) + 3] = (uint8_t)(v >> 24);
++                                        words++;
++                                }
++                                io_wr16(land_hc, SDHCI_INTSTAT, INT_RD_READY);
++                        }
++                        if (words >= 128 && (st & INT_XFER_DONE) != 0) {
++                                io_wr16(land_hc, SDHCI_INTSTAT, 0xffff);
++                                return 0;
++                        }
++                }
++        }
++        ++land_faults;
++        land_card_ready = 0;
++        return -998;
++}
++
++int
++land_emmc_ready(void)
++{
++        return land_ready();
++}
++
++/* Read nblk 512-byte blocks.  0 on success, negative on failure. */
++int
++land_emmc_read(uint64_t lba, void *buf, unsigned int nblk)
++{
++        uint8_t *p = (uint8_t *)buf;
++
++        if (!land_ready()) {
++                return -1;
++        }
++        for (unsigned int i = 0; i < nblk; i++) {
++                int rc = land_block(lba + i, p + (i * 512), 0);
++                if (rc != 0) {
++                        return rc;
++                }
++        }
++        return 0;
++}
++
++int
++land_emmc_write(uint64_t lba, const void *buf, unsigned int nblk)
++{
++        uint8_t *p = (uint8_t *)(uintptr_t)buf;
++
++        if (!land_ready()) {
++                return -1;
++        }
++        for (unsigned int i = 0; i < nblk; i++) {
++                int rc = land_block(lba + i, p + (i * 512), 1);
++                if (rc != 0) {
++                        return rc;
++                }
++        }
++        return 0;
++}
++
++uint64_t
++land_emmc_root_lba(void)
++{
++        return land_root_lba;
++}
++
++uint64_t
++land_emmc_root_bytes(void)
++{
++        return land_root_bytes;
++}
++
++unsigned int
++land_emmc_faults(void)
++{
++        return land_faults;
++}
++
++/* ------------------------------------------------------------------- probe */
++
++static const char land_hexdigits[] = "0123456789abcdef";
++
++static char *
++land_put_hex(char *p, const char *label, uint64_t v, int bits)
++{
++        while (*label != '\0') {
++                *p++ = *label++;
++        }
++        *p++ = '=';
++        for (int i = bits - 4; i >= 0; i -= 4) {
++                *p++ = land_hexdigits[(v >> i) & 0xf];
++        }
++        *p++ = ' ';
++        *p++ = '\n';
++        return p;
++}
++
++/*
++ * Run once from pe_identify_machine(): take the root location out of the ADT,
++ * read the first block of it and journal the result into dip, so a boot nobody
++ * watches the screen of is still readable from the PC.
++ */
++void
++land_emmc_probe(void)
++{
++        static uint8_t jblk[512] __attribute__((aligned(64)));
++        static char text[192];
++        DTEntry entryP = NULL;
++        void const *value = NULL;
++        uint32_t prop_size = 0;
++        char *p;
++        int enable = 1;
++        int rc, rb;
++
++        PE_parse_boot_argn("land_emmc", &enable, sizeof(enable));
++        if (!enable) {
++                return;
++        }
++        if (SecureDTFindEntry("name", "emmc", &entryP) != kSuccess) {
++                return;
++        }
++        if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
++            prop_size == sizeof(uint32_t)) {
++                land_root_lba = *(const uint32_t *)value;
++        }
++        if ((SecureDTGetProperty(entryP, "land,root-bytes", &value, &prop_size) == kSuccess) &&
++            prop_size == sizeof(uint64_t)) {
++                land_root_bytes = *(const uint64_t *)value;
++        }
++
++        kprintf("land-emmc: root lba 0x%lx bytes 0x%lx soc 0x%lx\n",
++            (unsigned long)land_root_lba, (unsigned long)land_root_bytes,
++            (unsigned long)pe_arm_get_soc_base_phys());
++
++        if (!land_ready()) {
++                kprintf("land-emmc: card init failed\n");
++                return;
++        }
++
++        rc = land_emmc_read(land_root_lba, jblk + 256, 1);
++        p = land_put_hex(text, "land-emmc rca", land_rca, 16);
++        p = land_put_hex(p, "read_rc", (uint64_t)(int64_t)rc, 16);
++        if (rc == 0) {
++                const uint32_t *w = (const uint32_t *)(jblk + 256);
++                p = land_put_hex(p, "w0", w[0], 32);
++                p = land_put_hex(p, "w1", w[1], 32);
++                /* the APFS container superblock starts with "NX" at +0x20 */
++                p = land_put_hex(p, "nxsig",
++                    *(const uint16_t *)(jblk + 256 + 0x20), 16);
++        }
++        p = land_put_hex(p, "faults", land_faults, 8);
++        kprintf("%s", text);
++
++        __builtin_memset(jblk, 0, 8);
++        __builtin_memcpy(jblk, JNL_MAGIC, 6);
++        __builtin_memcpy(jblk + 8, text, (size_t)(p - text));
++        jblk[510] = '\n';
++
++        rb = land_emmc_write(LAND_JNL_LBA, jblk, 1);
++        kprintf("land-emmc: journal lba 0x%lx write_rc=%d\n",
++            (unsigned long)LAND_JNL_LBA, rb);
++
++        if (rb == 0) {
++                __builtin_memset(jblk, 0, 64);
++                if ((land_emmc_read(LAND_JNL_LBA, jblk, 1) == 0) &&
++                    (__builtin_memcmp(jblk, JNL_MAGIC, 6) == 0)) {
++                        kprintf("land-emmc: journal read back OK\n");
++                } else {
++                        kprintf("land-emmc: journal read back FAILED\n");
++                }
++        }
++}
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index aa75c0a..a079a09 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -57,6 +57,15 @@ pe_identify_machine(boot_args * bootArgs)
+ 
+ 	(void)bootArgs;
+ 
++	{
++		extern void land_emmc_probe(void);
++
++		/* land: read block 0 of the root partition and journal the result
++		 * into dip, before anything can stop the boot silently.
++		 */
++		land_emmc_probe();
 +	}
-+	return -1000;
-+}
 +
-+int land_emmc_ready(void)
-+{
-+	if (!land_hc) {
-+		land_hc = ml_io_map(LAND_SDCC1_PHYS, LAND_SDCC1_SIZE);
-+		land_gcc = ml_io_map(0x01800000UL, 0x1000);
-+		if (!land_hc || !land_gcc)
-+			return 0;
-+		land_clock_on();
-+	}
-+	return land_hc != 0;
-+}
-+
-+/* Read nblk 512-byte blocks. Returns 0 on success, negative on failure. */
-+int land_emmc_read(uint64_t lba, void *buf, unsigned int nblk)
-+{
-+	if (!land_emmc_ready())
-+		return -1;
-+	if (land_rca == 0) {
-+		if (land_cmd(0, 0, 0))
-+			return -2;
-+		if (land_cmd(2, 0, SDHCI_CMD_CRCCHK))
-+			return -3;
-+		if (land_rca == 0)
-+			return -4;
-+	}
-+	if (land_cmd(7, land_rca << 16, SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
-+		return -5;
-+	if (land_cmd(16, 512, SDHCI_CMD_CRCCHK | SDHCI_CMD_IDXCHK))
-+		return -6;
-+	if (land_transfer(lba, buf, nblk)) {
-+		++land_faults;
-+		land_rca = 0;			/* force a re-identify next time */
-+		return -7;
-+	}
-+	return 0;
-+}
-+
-+unsigned int land_emmc_faults(void)
-+{
-+	return (unsigned int)land_faults;
-+}
--- 
-2.43.0.windows.1
-
+ 	if (pe_arm_get_soc_base_phys() == 0) {
+ 		return;
+ 	}
+diff --git a/pexpert/conf/files.arm64 b/pexpert/conf/files.arm64
+index 20b9ae7..8055bee 100644
+--- a/pexpert/conf/files.arm64
++++ b/pexpert/conf/files.arm64
+@@ -5,3 +5,4 @@ pexpert/arm/pe_identify_machine.c      standard
+ pexpert/arm/pe_init.c                  standard
+ pexpert/arm/pe_kprintf.c               standard
+ pexpert/arm/pe_serial.c                standard
++pexpert/arm/land_sdhci.c              standard
