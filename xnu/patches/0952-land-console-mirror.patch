@@ -1,0 +1,26 @@
+land: mirror every console character into dip from pexpert
+
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..f1cf500 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -27,6 +27,10 @@
+ #include <pexpert/arm64/board_config.h>
+ #include <arm64/proc_reg.h>
+ #include <arm64/sweet_early.h>
++
++/* land: pexpert/arm/land_sdhci.c mirrors console characters into the dip partition */
++extern void land_console_tap(char c);
++
+ #include <pexpert/arm/protos.h>
+ #include <kern/sched_prim.h>
+ #if HIBERNATION
+@@ -1153,6 +1157,8 @@ uart_putc_options_(char c, bool poll, bool force)
+ {
+ 	struct pe_serial_functions *fns = gPESF;
+ 
++	land_console_tap(c);
++
+ 	while (fns != NULL) {
+ 		if (force || serial_do_transmit) {
+ 			while (!fns->transmit_ready()) {

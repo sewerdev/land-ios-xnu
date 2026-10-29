@@ -2,10 +2,10 @@ land: eMMC PIO reader, its registration and one boot-time probe
 
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..2b09319
+index 0000000..b421272
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,609 @@
 +/*
 + * land_sdhci.c - eMMC access for the Redmi 3S (land, MSM8937) from XNU.
 + *
@@ -47,6 +47,7 @@ index 0000000..2b09319
 +extern uint64_t land_emmc_root_lba(void);
 +extern uint64_t land_emmc_root_bytes(void);
 +extern unsigned int land_emmc_faults(void);
++extern void land_console_tap(char c);
 +
 +#define LAND_CORE_PHYS  0x07824000UL
 +#define LAND_CORE_SIZE  0x2F00
@@ -474,80 +475,145 @@ index 0000000..2b09319
 +        return p;
 +}
 +
++/* ------------------------------------------------------------------ console
++ *
++ * Nobody films the phone screen for us, so everything that reaches the console
++ * is mirrored into dip.  uart_putc_options_() in pexpert/arm/pe_serial.c calls
++ * land_console_tap() per character; the ring is rewritten at LAND_JNL_LBA (never
++ * appended, so a torn read is impossible) once a line ends.  The tap runs below
++ * kprintf, so it needs no console lock, and a controller failure only silences
++ * the mirror for a while - the console itself must never depend on eMMC.
++ */
++
++#define LAND_LOG_BYTES  4096u
++#define LAND_LOG_BLOCKS (LAND_LOG_BYTES / 512u)
++#define LAND_LOG_HDR    32u
++
++static char land_log[LAND_LOG_BYTES];
++static unsigned int land_log_used;               /* write cursor, mod ring size */
++static unsigned int land_log_since;               /* chars since the last flush */
++static uint64_t land_log_total;
++static unsigned int land_log_seq;
++static int land_log_silent;                       /* skip this many chars */
++static int land_log_busy;
++
++static void
++land_log_flush(void)
++{
++        uint8_t blk[512];
++        unsigned int head = land_log_used;        /* oldest byte follows the cursor */
++        unsigned int i;
++
++        if (land_log_busy || !land_ready()) {
++                return;
++        }
++        land_log_busy = 1;
++        for (i = 0; i < LAND_LOG_BLOCKS; i++) {
++                unsigned int n = 0;
++
++                if (i == 0) {
++                        char *p = (char *)blk;
++
++                        __builtin_memcpy(p, "LANDLOG1", 8);
++                        p += 8;
++                        p = land_put_hex(p, "seq", land_log_seq, 8);
++                        p = land_put_hex(p, "total", land_log_total, 16);
++                        p = land_put_hex(p, "head", head, 16);
++                        p = land_put_hex(p, "faults", land_faults, 8);
++                        while ((unsigned int)(p - (char *)blk) < LAND_LOG_HDR - 1) {
++                                *p++ = ' ';
++                        }
++                        *p = '\n';
++                        n = LAND_LOG_HDR;
++                }
++                for (; n < 512; n++) {
++                        blk[n] = (uint8_t)land_log[(head + n) % LAND_LOG_BYTES];
++                }
++                if (land_block(LAND_JNL_LBA + i, blk, 1) != 0) {
++                        break;
++                }
++        }
++        if (i == LAND_LOG_BLOCKS) {
++                ++land_log_seq;
++        }
++        land_log_since = 0;
++        land_log_busy = 0;
++}
++
++void
++land_console_tap(char c)
++{
++        if (land_log_busy) {
++                return;
++        }
++        if (land_log_silent > 0) {
++                if (--land_log_silent == 0) {
++                        land_ready();             /* give the controller another try */
++                }
++                return;
++        }
++        if (!land_ready()) {
++                land_log_silent = 65536;
++                return;
++        }
++        land_log[land_log_used] = c;
++        land_log_used = (land_log_used + 1) % LAND_LOG_BYTES;
++        land_log_total++;
++        land_log_since++;
++        if (c == '\n' && land_log_since >= 512) {
++                land_log_flush();
++        }
++}
++
 +/*
-+ * Run once from pe_identify_machine(): take the root location out of the ADT,
-+ * read the first block of it and journal the result into dip, so a boot nobody
-+ * watches the screen of is still readable from the PC.
++ * Run once from pe_identify_machine().  Everything it says goes through the
++ * console mirror above, so it is enough to talk and then flush.
 + */
 +void
 +land_emmc_probe(void)
 +{
-+        static uint8_t jblk[512] __attribute__((aligned(64)));
-+        static char text[192];
++        static uint8_t rdbuf[512] __attribute__((aligned(64)));
 +        DTEntry entryP = NULL;
 +        void const *value = NULL;
 +        uint32_t prop_size = 0;
-+        char *p;
 +        int enable = 1;
-+        int rc, rb;
++        int rc;
 +
 +        PE_parse_boot_argn("land_emmc", &enable, sizeof(enable));
 +        if (!enable) {
 +                return;
 +        }
-+        if (SecureDTFindEntry("name", "emmc", &entryP) != kSuccess) {
-+                return;
++        if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {
++                if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
++                    prop_size == sizeof(uint32_t)) {
++                        land_root_lba = *(const uint32_t *)value;
++                }
++                if ((SecureDTGetProperty(entryP, "land,root-bytes", &value, &prop_size) == kSuccess) &&
++                    prop_size == sizeof(uint64_t)) {
++                        land_root_bytes = *(const uint64_t *)value;
++                }
++        } else {
++                kprintf("land-emmc: no /emmc node, using built-in geometry
++");
 +        }
-+        if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
-+            prop_size == sizeof(uint32_t)) {
-+                land_root_lba = *(const uint32_t *)value;
-+        }
-+        if ((SecureDTGetProperty(entryP, "land,root-bytes", &value, &prop_size) == kSuccess) &&
-+            prop_size == sizeof(uint64_t)) {
-+                land_root_bytes = *(const uint64_t *)value;
-+        }
-+
-+        kprintf("land-emmc: root lba 0x%lx bytes 0x%lx soc 0x%lx\n",
++        kprintf("land-emmc: root lba 0x%lx bytes 0x%lx soc 0x%lx
++",
 +            (unsigned long)land_root_lba, (unsigned long)land_root_bytes,
 +            (unsigned long)pe_arm_get_soc_base_phys());
 +
-+        if (!land_ready()) {
-+                kprintf("land-emmc: card init failed\n");
-+                return;
-+        }
-+
-+        rc = land_emmc_read(land_root_lba, jblk + 256, 1);
-+        p = land_put_hex(text, "land-emmc rca", land_rca, 16);
-+        p = land_put_hex(p, "read_rc", (uint64_t)(int64_t)rc, 16);
++        rc = land_ready() ? 0 : -1;
++        kprintf("land-emmc: card %s rca=%x faults=%u
++",
++            rc == 0 ? "ready" : "INIT FAILED", land_rca, land_faults);
 +        if (rc == 0) {
-+                const uint32_t *w = (const uint32_t *)(jblk + 256);
-+                p = land_put_hex(p, "w0", w[0], 32);
-+                p = land_put_hex(p, "w1", w[1], 32);
-+                /* the APFS container superblock starts with "NX" at +0x20 */
-+                p = land_put_hex(p, "nxsig",
-+                    *(const uint16_t *)(jblk + 256 + 0x20), 16);
++                rc = land_emmc_read(land_root_lba, rdbuf, 1);
++                kprintf("land-emmc: read rc=%d w0=%x w1=%x sig=%x mirror=%u/%lx
++",
++                    rc, *(uint32_t *)rdbuf, ((uint32_t *)rdbuf)[1],
++                    *(uint16_t *)(rdbuf + 0x20), land_log_seq,
++                    (unsigned long)land_log_total);
 +        }
-+        p = land_put_hex(p, "faults", land_faults, 8);
-+        kprintf("%s", text);
-+
-+        __builtin_memset(jblk, 0, 8);
-+        __builtin_memcpy(jblk, JNL_MAGIC, 6);
-+        __builtin_memcpy(jblk + 8, text, (size_t)(p - text));
-+        jblk[510] = '\n';
-+
-+        rb = land_emmc_write(LAND_JNL_LBA, jblk, 1);
-+        kprintf("land-emmc: journal lba 0x%lx write_rc=%d\n",
-+            (unsigned long)LAND_JNL_LBA, rb);
-+
-+        if (rb == 0) {
-+                __builtin_memset(jblk, 0, 64);
-+                if ((land_emmc_read(LAND_JNL_LBA, jblk, 1) == 0) &&
-+                    (__builtin_memcmp(jblk, JNL_MAGIC, 6) == 0)) {
-+                        kprintf("land-emmc: journal read back OK\n");
-+                } else {
-+                        kprintf("land-emmc: journal read back FAILED\n");
-+                }
-+        }
++        land_log_flush();
 +}
 diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
 index aa75c0a..a079a09 100644
