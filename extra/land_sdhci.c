@@ -40,6 +40,7 @@ extern uint64_t land_emmc_root_lba(void);
 extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
+extern void land_mark(const char *tag);
 
 #define LAND_CORE_PHYS  0x07824000UL
 #define LAND_CORE_SIZE  0x2F00
@@ -102,7 +103,8 @@ extern void land_console_tap(char c);
 /* dip is the diagnostic partition the shim journals into.  The kernel writes
  * its own record 32 KiB further in so the two never overwrite each other. */
 #define LAND_DIP_LBA    8389632ULL
-#define LAND_JNL_LBA    (LAND_DIP_LBA + 64)
+#define LAND_JNL_LBA    (LAND_DIP_LBA + 64)   /* 8 blocks: the console mirror */
+#define LAND_MARK_LBA   (LAND_DIP_LBA + 16)  /* 16 blocks: stage marks ring */
 #define JNL_MAGIC       "LANDK1"
 
 static vm_offset_t land_core;
@@ -552,9 +554,42 @@ land_console_tap(char c)
         land_log_used = (land_log_used + 1) % LAND_LOG_BYTES;
         land_log_total++;
         land_log_since++;
-        if (c == '\n' && land_log_since >= 512) {
+        if (c == '\n' && land_log_since >= 64) {
                 land_log_flush();
         }
+}
+
+/*
+ * Stage marks: a 512-byte record per boot milestone in a 16-slot ring in dip.
+ * This path never touches the console, which is what may be broken this early,
+ * so the last slot still says how far the boot came.
+ */
+static unsigned int land_mark_seq;
+
+void
+land_mark(const char *tag)
+{
+        uint8_t blk[512];
+        char *p;
+
+        if (land_log_busy || !land_ready()) {
+                return;
+        }
+        land_log_busy = 1;
+        __builtin_memset(blk, 0, sizeof(blk));
+        p = (char *)blk;
+        __builtin_memcpy(p, "LANDK2 ", 7);
+        p += 7;
+        p = land_put_hex(p, "seq", land_mark_seq, 8);
+        while (*tag != 0 && (unsigned int)(p - (char *)blk) < 470) {
+                *p++ = *tag++;
+        }
+        *p++ = ' ';
+        p = land_put_hex(p, "rca", land_rca, 8);
+        p = land_put_hex(p, "faults", land_faults, 8);
+        (void)land_block(LAND_MARK_LBA + (land_mark_seq % 16u), blk, 1);
+        ++land_mark_seq;
+        land_log_busy = 0;
 }
 
 /*
@@ -585,22 +620,18 @@ land_emmc_probe(void)
                         land_root_bytes = *(const uint64_t *)value;
                 }
         } else {
-                kprintf("land-emmc: no /emmc node, using built-in geometry
-");
+                kprintf("land-emmc: no /emmc node, using built-in geometry\n");
         }
-        kprintf("land-emmc: root lba 0x%lx bytes 0x%lx soc 0x%lx
-",
+        kprintf("land-emmc: root lba 0x%lx bytes 0x%lx soc 0x%lx\n",
             (unsigned long)land_root_lba, (unsigned long)land_root_bytes,
             (unsigned long)pe_arm_get_soc_base_phys());
 
         rc = land_ready() ? 0 : -1;
-        kprintf("land-emmc: card %s rca=%x faults=%u
-",
+        kprintf("land-emmc: card %s rca=%x faults=%u\n",
             rc == 0 ? "ready" : "INIT FAILED", land_rca, land_faults);
         if (rc == 0) {
                 rc = land_emmc_read(land_root_lba, rdbuf, 1);
-                kprintf("land-emmc: read rc=%d w0=%x w1=%x sig=%x mirror=%u/%lx
-",
+                kprintf("land-emmc: read rc=%d w0=%x w1=%x sig=%x mirror=%u/%lx\n",
                     rc, *(uint32_t *)rdbuf, ((uint32_t *)rdbuf)[1],
                     *(uint16_t *)(rdbuf + 0x20), land_log_seq,
                     (unsigned long)land_log_total);

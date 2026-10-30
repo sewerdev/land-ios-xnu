@@ -1,0 +1,62 @@
+land: boot stage marks written straight to dip
+
+Four call sites (arm_vm_init, arm_init, bsd_init, IOFindBSDRoot) record how far the
+boot came.  land_mark() does not use the console, so it still works when the early
+print path is what is broken.
+---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..df28256 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -476,6 +476,9 @@ bsd_rooted_ramdisk(void)
+ void
+ bsd_init(void)
+ {
++	/* land: stage mark (pexpert/arm/land_sdhci.c); dip keeps the last 16 */
++extern void land_mark(const char *tag);
++	land_mark("bsdinit");
+ 	struct uthread *ut;
+ 	vnode_t init_rootvnode = NULLVP;
+ 	struct proc_ro_data kernproc_ro_data = {
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..a78bdea 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -655,6 +655,9 @@ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+ {
++	/* land: stage mark (pexpert/arm/land_sdhci.c); dip keeps the last 16 */
++extern "C" void land_mark(const char *tag);
++	land_mark("rootfind");
+ 	mach_timespec_t     t;
+ 	IOService *         service;
+ 	IORegistryEntry *   regEntry;
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..2770ee9 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -340,6 +340,9 @@ void
+ arm_init(
+ 	boot_args       *args)
+ {
++	/* land: stage mark (pexpert/arm/land_sdhci.c); dip keeps the last 16 */
++extern void land_mark(const char *tag);
++	land_mark("arminit");
+ 	unsigned int    maxmem;
+ 	uint32_t        memsize;
+ 	uint64_t        xmaxmem;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 9a51f14..2978a56 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1892,6 +1892,9 @@ sweet_early_map_final(void)
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
++	/* land: stage mark (pexpert/arm/land_sdhci.c); dip keeps the last 16 */
++extern void land_mark(const char *tag);
++	land_mark("vm");
+ 	vm_map_address_t va_l1, va_l1_end;
+ 	tt_entry_t       *cpu_l1_tte;
+ 	vm_map_address_t va_l2, va_l2_end;
