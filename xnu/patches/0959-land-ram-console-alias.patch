@@ -11,7 +11,7 @@ last framebuffer block of the kernel table (no slot was free either side of it),
 and both arm pexpert/arm/land_sdhci.c with the address to mirror into.
 ---
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 9a51f14..f1f43bf 100644
+index 9a51f14..3a12201 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
 @@ -1832,7 +1832,27 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
@@ -42,7 +42,7 @@ index 9a51f14..f1f43bf 100644
  
  static void
  sweet_early_map_final(void)
-@@ -1858,6 +1878,27 @@ sweet_early_map_final(void)
+@@ -1858,6 +1878,31 @@ sweet_early_map_final(void)
  		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
  		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
  	}
@@ -55,7 +55,11 @@ index 9a51f14..f1f43bf 100644
 +	 * mapping that goes away with TTBR0, which is an abort inside the panic path
 +	 * and the exact silence this channel exists to break.
 +	 */
-+	if (first + 7 <= TTE_PGENTRIES) {
++	/* first + 6 <= TTE_PGENTRIES already holds (the framebuffer loop above
++	 * checked it), so slot first + 5 is inside this table by construction: using
++	 * first + 7 here was the framebuffer bound, not ours, and it skipped the
++	 * alias on every real table. */
++	if (first + 6 <= TTE_PGENTRIES) {
 +		l2[first + 5] = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 +		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
 +		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
@@ -70,7 +74,7 @@ index 9a51f14..f1f43bf 100644
  	__asm__ volatile("dsb ishst" ::: "memory");
  	sweet_early_fb_mapped = true;
  }
-@@ -1902,6 +1943,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1902,6 +1947,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	vm_offset_t      ptpage_vaddr;
  	vm_map_address_t dynamic_memory_begin;
  
@@ -85,7 +89,7 @@ index 9a51f14..f1f43bf 100644
  	/*
  	 * Get the virtual and physical kernel-managed memory base from boot_args.
  	 */
-@@ -2233,6 +2282,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2233,6 +2286,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	} else {
  		sweet_early_disable();
  	}
@@ -99,10 +103,10 @@ index 9a51f14..f1f43bf 100644
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e160b46..10fdf32 100644
+index a6cbe0b..cc7e0e8 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -735,6 +735,16 @@ Ltopaz_fb_block:
+@@ -739,6 +739,16 @@ Ltopaz_fb_block:
  	add		x11, x11, #(ARM_TT_L2_SIZE)
  	subs	x12, x12, #1
  	b.ne	Ltopaz_fb_block

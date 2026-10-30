@@ -619,6 +619,48 @@ land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux)
 	__asm__ volatile("dsb ishst" ::: "memory");
 }
 
+/*
+ * The cpu map, reported without kprintf: the failing lookup happens while the
+ * serial layer can still be switched off, and a message that never reaches the
+ * console is no message at all.  This goes straight through the same tap that
+ * carries the console into retained DRAM, so a phone boot nobody watches is
+ * still readable.  ids[] is the caller's copy of the phys_ids the device tree
+ * described, n of them.
+ */
+void
+land_cpumap_report(uint32_t want, uint64_t mpidr, int num_cpus, int max_cpu_id,
+    const uint32_t *ids, int n)
+{
+	static const char lbl[] = "land cpumap: want ";
+	const char *p;
+	int i;
+
+	for (p = lbl; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	land_ram_hex(want, 8);
+	for (p = " mpidr "; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	land_ram_hex(mpidr, 16);
+	for (p = " num_cpus "; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	land_ram_hex((uint64_t)num_cpus, 8);
+	for (p = " max_cpu_id "; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	land_ram_hex((uint64_t)max_cpu_id, 8);
+	for (p = " ids"; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	for (i = 0; i < n; i++) {
+		land_console_tap(' ');
+		land_ram_hex(ids[i], 8);
+	}
+	land_console_tap('\n');
+}
+
 /* ------------------------------------------------------------------ console
  *
  * Nobody films the phone screen for us, so everything that reaches the console
