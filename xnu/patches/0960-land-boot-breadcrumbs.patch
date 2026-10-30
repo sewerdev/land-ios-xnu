@@ -9,20 +9,27 @@ into dip blocks 32..47 on the next boot, so the stage mask names the
 interval the boot stopped in.
 ---
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..1ff7747 100644
+index 42362c5..f50c9b0 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -340,6 +340,14 @@ void
+@@ -340,6 +340,21 @@ void
  arm_init(
  	boot_args       *args)
  {
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	extern void land_boot_mark(unsigned int stage);
++	extern void land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux);
 +
 +	/* Stage 7: the assembly boot path finished, so the exception vectors,
 +	 * TCR, TTBR, SCTLR and the tunables all took effect on this hardware.
 +	 */
 +	land_boot_mark(7);
++	/* The bootstrap alias start.s made for the framebuffer console is live
++	 * from here on, so the console can be mirrored into DRAM two functions
++	 * before arm_vm_init: whatever kills this boot leaves its own panic text
++	 * behind.  0x60df0000 is SWEET_EARLY_RAM_BOOT_VA in arm_vm_init.c.
++	 */
++	land_ram_console_arm(0x60df0000ULL, "arm_init on the bootstrap alias", 0);
 +#endif
  	unsigned int    maxmem;
  	uint32_t        memsize;
