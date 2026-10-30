@@ -41,7 +41,8 @@ extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
 extern void land_mark(const char *tag);
-extern void land_ram_console_arm(uint64_t va, const char *tag);
+extern void land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux);
+extern void land_boot_mark(unsigned int stage);
 
 #define LAND_CORE_PHYS  0x07824000UL
 #define LAND_CORE_SIZE  0x2F00
@@ -492,10 +493,28 @@ land_put_hex(char *p, const char *label, uint64_t v, int bits)
 #define LAND_RAM_RING   (LAND_RAM_BYTES - LAND_RAM_HDR)
 
 static volatile char *land_ram;                 /* NULL until the alias exists */
+static volatile uint64_t *land_brd;             /* the page before it: stages */
 static unsigned int land_ram_used;              /* write cursor, mod ring size */
 static uint64_t land_ram_total;
 static uint64_t land_ram_boot;
 static unsigned int land_ram_lines;
+
+/*
+ * Cold boot stages, the C half of what start.s breadcrumbs (patch 0960).  The
+ * page is ordinary memory, so this is legal before anything exists: no lock,
+ * no allocation, no console.  Called before the alias is armed it does nothing,
+ * which is also an answer.
+ */
+void
+land_boot_mark(unsigned int stage)
+{
+	if (land_brd == NULL) {
+		return;
+	}
+	land_brd[2] = stage;
+	land_brd[3] |= 1ULL << stage;
+	__asm__ volatile("dsb sy" ::: "memory");
+}
 
 static void
 land_ram_header(void)
@@ -527,13 +546,23 @@ land_ram_tap(char c)
 	}
 }
 
+static void
+land_ram_hex(uint64_t v, int bits)
+{
+	for (int i = bits - 4; i >= 0; i -= 4) {
+		land_ram_tap(land_hexdigits[(v >> i) & 0xf]);
+	}
+}
+
 /*
  * Called from arm_vm_init twice: once with the bootstrap alias (VA=PA region
  * start.s builds) and once when the kernel's own alias is live.  The boot
  * counter is read from the page left by the previous boot, so the host can
  * still tell which run a page came from after the pointer moves.  The tag goes
  * into the ring as the first thing the page ever hears, so a boot that dies
- * right here still says which of the two addresses it died writing to.
+ * right here still says which of the two addresses it died writing to, and aux
+ * carries the L2 slot the kernel table gave up (first<<16|slot) because
+ * "there was no slot" is a fact worth reading without a rebuild.
  *
  * va == 0 means the kernel alias never came up: the bootstrap mapping is about
  * to be torn down with TTBR0, so write the farewell through it and then stop
@@ -541,13 +570,15 @@ land_ram_tap(char c)
  * inside the panic path, which is how a boot stops reporting anything at all.
  */
 void
-land_ram_console_arm(uint64_t va, const char *tag)
+land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux)
 {
 	volatile uint64_t *h = (volatile uint64_t *)(uintptr_t)va;
 	const char *p;
 
 	if (va != 0) {
 		land_ram = (volatile char *)(uintptr_t)va;
+		/* The breadcrumb page is the one before this, same 2 MiB block */
+		land_brd = (volatile uint64_t *)(uintptr_t)(va - 0x10000);
 		if (land_ram_boot == 0) {
 			land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
 		}
@@ -559,9 +590,18 @@ land_ram_console_arm(uint64_t va, const char *tag)
 	for (p = tag; *p != '\0'; p++) {
 		land_ram_tap(*p);
 	}
+	if (aux != 0) {
+		for (p = " aux="; *p != '\0'; p++) {
+			land_ram_tap(*p);
+		}
+		land_ram_hex(aux, 8);
+	}
 	land_ram_tap('\n');
 	if (va == 0) {
 		land_ram = NULL;
+		land_brd = NULL;
+	} else {
+		land_boot_mark(5);
 	}
 	__asm__ volatile("dsb ishst" ::: "memory");
 }

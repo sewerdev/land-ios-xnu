@@ -1,0 +1,105 @@
+land: breadcrumb the cold boot path into retained DRAM
+
+The dip readback says the shim jumps and arm_vm_init never runs, so what is
+left is start.s and the head of arm_init: no console, no readable output.
+Stores to the 4 KiB page before the early-console page (same 2 MiB block,
+physical address until the MMU is on, alias after) mark four intervals, and
+arm_vm_init and land_sdhci.c add the two that follow.  The shim lifts 8 KiB
+into dip blocks 32..47 on the next boot, so the stage mask names the
+interval the boot stopped in.
+---
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..3e84150 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -340,6 +340,14 @@ void
+ arm_init(
+ 	boot_args       *args)
+ {
++#if defined(SWEET) && defined(TOPAZ_4K)
++	extern void land_boot_mark(unsigned int stage);
++
++	/* Stage 4: the assembly boot path finished, so the exception vectors,
++	 * TCR, TTBR and SCTLR all took effect on this hardware.
++	 */
++	land_boot_mark(4);
++#endif
+ 	unsigned int    maxmem;
+ 	uint32_t        memsize;
+ 	uint64_t        xmaxmem;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 60ce933..182af98 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -451,6 +451,27 @@ start_cpu:
+ 	b.ne	1b
+ .endmacro
+ 
++/*
++ * land_brd: mark one stage of the cold boot path in the retained breadcrumb
++ * page (the 4 KiB before the early-console page, inside the same 2 MiB block
++ * start.s maps, so it needs no new mapping and no eMMC).  Nothing in this
++ * region has a console, and DRAM there survives the watchdog reset, so the
++ * last stage written is the interval the boot died in.  x2 and x3 are scratch
++ * and the page address goes in x1, which is why every call site sits where a
++ * register dump says they are dead; x19..x26 are live across this code.
++ *
++ * Layout of the page: +0 magic, +8 boot count, +16 last stage, +24 OR of 1<<stage.
++ */
++.macro land_brd n, addr
++	mov	x1, \addr
++	mov	w2, #\n
++	str	w2, [x1, #16]
++	ldr	x3, [x1, #24]
++	orr	x3, x3, #(1 << \n)
++	str	x3, [x1, #24]
++	dsb	sy
++.endmacro
++
+ /*
+  *  arg0 - virtual start address
+  *  arg1 - physical start address
+@@ -512,6 +533,18 @@ LEXT(start_first_cpu)
+ 
+ 	mov		x20, x0
+ 	mov		x21, #0
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 1: the kernel image is running.  MMU off, so the page is reached
++	 * at its physical address.  The boot count carries over resets, which is
++	 * how a stale page from an older run is recognised. */
++	MOV64	x1, 0xb07e0000
++	MOV64	x2, 0x31445242444E414C		/* "LANDBRD1" */
++	str		x2, [x1]
++	ldr		x2, [x1, #8]
++	add		x2, x2, #1
++	str		x2, [x1, #8]
++	land_brd 1, 0xb07e0000
++#endif
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+@@ -735,6 +768,11 @@ Ltopaz_fb_block:
+ 	dsb		ish
+ 
+ 
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 2: the bootstrap tables are written; what comes next in
++	 * common_start is TCR/TTBR/MAIR and the MMU enable itself. */
++	land_brd 2, 0xb07e0000
++#endif
+ 	b		common_start
+ 
+ /*
+@@ -872,6 +910,12 @@ common_start:
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 3: translations are live.  From here the page is reached through
++	 * the alias in the VA=PA table, 0x60c00000 + the block offset of 0xb07e0000.
++	 */
++	land_brd 3, 0x60de0000
++#endif
+ 
+ #if !VMAPPLE && !defined(SWEET)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT

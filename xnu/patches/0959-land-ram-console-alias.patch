@@ -9,10 +9,10 @@ blocks, arm_vm_init puts the same block in the kernel table, and both arm
 pexpert/arm/land_sdhci.c with the page address it should mirror into.
 ---
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 9a51f14..c29240a 100644
+index 9a51f14..e7b209b 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1832,7 +1832,25 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+@@ -1832,7 +1832,26 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
   * survives the TTBR0 teardown. Slots in use or no L2 table: no alias.
   */
  #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
@@ -32,27 +32,40 @@ index 9a51f14..c29240a 100644
  static bool sweet_early_fb_mapped;
 +static bool sweet_early_ram_mapped;
 +static vm_map_address_t sweet_early_ram_va;
++static uint64_t sweet_early_ram_aux;
 +
 +/* pexpert/arm/land_sdhci.c owns the page layout */
-+extern void land_ram_console_arm(uint64_t va, const char *tag);
++extern void land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux);
  
  static void
  sweet_early_map_final(void)
-@@ -1858,6 +1876,29 @@ sweet_early_map_final(void)
+@@ -1858,6 +1877,46 @@ sweet_early_map_final(void)
  		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
  		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
  	}
 +	/* Nothing may depend on eMMC being up to record how the boot died, so the
-+	 * retained console page joins this table in the first free slot past the
-+	 * framebuffer.  It has to be a slot this table actually gives us: the pointer
-+	 * would otherwise stay on the bootstrap alias, which goes away with TTBR0, and
-+	 * a store into a torn-down mapping is an abort inside the panic path - which is
-+	 * exactly the silence this channel exists to break.
++	 * retained console page joins this table in a free slot.  Which slots are
++	 * free is not knowable from here: QEMU showed the six past the framebuffer
++	 * were already spoken for, so the search goes backwards from the framebuffer
++	 * first and only then forward.  The slot is reported through the arm call
++	 * because a pointer to the wrong alias is an abort inside the panic path,
++	 * which is exactly the silence this channel exists to break.
 +	 */
 +	if (first + 7 <= TTE_PGENTRIES) {
-+		unsigned int slot = first + 6;
-+		while (slot < TTE_PGENTRIES && l2[slot] != ARM_TTE_EMPTY) {
-+			slot++;
++		unsigned int slot = TTE_PGENTRIES;
++		unsigned int i;
++
++		for (i = first; i-- > 0;) {
++			if (l2[i] == ARM_TTE_EMPTY) {
++				slot = i;
++				break;
++			}
++		}
++		for (i = first + 6; slot == TTE_PGENTRIES && i < TTE_PGENTRIES; i++) {
++			if (l2[i] == ARM_TTE_EMPTY) {
++				slot = i;
++				break;
++			}
 +		}
 +		if (slot < TTE_PGENTRIES) {
 +			l2[slot] = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
@@ -62,13 +75,18 @@ index 9a51f14..c29240a 100644
 +			__asm__ volatile("dsb ishst" ::: "memory");
 +			sweet_early_ram_va = (va - ((vm_map_address_t)first * ARM_TT_L2_SIZE)) +
 +			    ((vm_map_address_t)slot << ARM_TT_L2_SHIFT) + SWEET_EARLY_RAM_PAGE_OFF;
++			sweet_early_ram_aux = ((uint64_t)first << 16) | slot;
 +			sweet_early_ram_mapped = true;
++		} else {
++			sweet_early_ram_aux = ((uint64_t)first << 16) | 0xffff;
 +		}
++	} else {
++		sweet_early_ram_aux = 0xffffffff;
 +	}
  	__asm__ volatile("dsb ishst" ::: "memory");
  	sweet_early_fb_mapped = true;
  }
-@@ -1902,6 +1943,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1902,6 +1961,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	vm_offset_t      ptpage_vaddr;
  	vm_map_address_t dynamic_memory_begin;
  
@@ -77,13 +95,13 @@ index 9a51f14..c29240a 100644
 +	 * everything this function prints is captured even if the boot never gets to
 +	 * its own page tables - which is where the phone boot stops.
 +	 */
-+	land_ram_console_arm(SWEET_EARLY_RAM_BOOT_VA, "the bootstrap alias");
++	land_ram_console_arm(SWEET_EARLY_RAM_BOOT_VA, "the bootstrap alias", 0);
 +#endif
 +
  	/*
  	 * Get the virtual and physical kernel-managed memory base from boot_args.
  	 */
-@@ -2233,6 +2282,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2233,6 +2300,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	} else {
  		sweet_early_disable();
  	}
@@ -91,7 +109,8 @@ index 9a51f14..c29240a 100644
 +	 * memory entirely if the table had no slot left for it.
 +	 */
 +	land_ram_console_arm(sweet_early_ram_mapped ? sweet_early_ram_va : 0,
-+	    sweet_early_ram_mapped ? "the kernel alias" : "no kernel slot, console off");
++	    sweet_early_ram_mapped ? "the kernel alias" : "no kernel slot, console off",
++	    sweet_early_ram_aux);
  #elif defined(SWEET)
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
