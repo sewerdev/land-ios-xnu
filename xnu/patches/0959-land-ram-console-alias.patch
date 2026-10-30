@@ -1,33 +1,36 @@
 land: alias the retained RAM console page into both page tables
 
 The phone boot dies before it can journal anything, and the journal lives on
-eMMC, so the early console also needs somewhere that is not a disk.  Android
-reserves ramoops@b0000000 (8 MiB), its last 4 KiB is unused, and the shim
-measured that DRAM there survives the watchdog bark.  start.s puts a 2 MiB
-Normal-NC block in the V=P bootstrap table one slot past the framebuffer
-blocks, arm_vm_init puts the same block in the kernel table, and both arm
-pexpert/arm/land_sdhci.c with the page address it should mirror into.
+eMMC, so the early console also needs somewhere that is not a disk.  The tail
+of Android's ramoops@b0000000 survives the watchdog bark but not the Linux
+session that follows the reset - the shim found its own page full of HIDL log -
+so the page is now the tail of other_ext_region (0x84a00000 + 0x1e00000), which
+the same probe left alone.  start.s puts a 2 MiB Normal-NC block in the V=P
+bootstrap table one slot past the framebuffer blocks, arm_vm_init reuses the
+last framebuffer block of the kernel table (no slot was free either side of it),
+and both arm pexpert/arm/land_sdhci.c with the address to mirror into.
 ---
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 9a51f14..e7b209b 100644
+index 9a51f14..f1f43bf 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
-@@ -1832,7 +1832,26 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+@@ -1832,7 +1832,27 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
   * survives the TTBR0 teardown. Slots in use or no L2 table: no alias.
   */
  #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
 +/*
 + * land (Redmi 3S): the console also goes into DRAM that outlives the reset - the
-+ * last 4 KiB of the region Android reserves as ramoops@b0000000 (LK leaves a warm
-+ * reset region alone, measured).  Block entries are 2 MiB, so the alias maps the
-+ * block containing it and the page is 0x1f0000 further in.  The shim reads the page
-+ * at the start of the next boot and journals it into dip blocks 32..39.
++ * last page of other_ext_region (0x84a00000 + 0x1e00000), which the shim measured
++ * as surviving a Linux session, unlike the tail of Android's ramoops@b0000000
++ * that this used to live in.  Block entries are 2 MiB, so the alias maps the
++ * block containing it and the page is 0x1ff000 further in.  The shim reads the
++ * page at the start of the next boot and journals it into dip blocks 32..47.
 + *
 + * Both aliases sit one slot past the six framebuffer blocks, here and in start.s,
 + * so the block count must not change in one without the other.
 + */
-+#define SWEET_EARLY_RAM_BLOCK_PA   0xb0600000ULL
-+#define SWEET_EARLY_RAM_PAGE_OFF   0x1f0000ULL
++#define SWEET_EARLY_RAM_BLOCK_PA   0x86600000ULL
++#define SWEET_EARLY_RAM_PAGE_OFF   0x1ff000ULL
 +#define SWEET_EARLY_RAM_BOOT_VA    (0x60000000ULL + (6 * ARM_TT_L2_SIZE) + SWEET_EARLY_RAM_PAGE_OFF)
  static bool sweet_early_fb_mapped;
 +static bool sweet_early_ram_mapped;
@@ -39,54 +42,35 @@ index 9a51f14..e7b209b 100644
  
  static void
  sweet_early_map_final(void)
-@@ -1858,6 +1877,46 @@ sweet_early_map_final(void)
+@@ -1858,6 +1878,27 @@ sweet_early_map_final(void)
  		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
  		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
  	}
-+	/* Nothing may depend on eMMC being up to record how the boot died, so the
-+	 * retained console page joins this table in a free slot.  Which slots are
-+	 * free is not knowable from here: QEMU showed the six past the framebuffer
-+	 * were already spoken for, so the search goes backwards from the framebuffer
-+	 * first and only then forward.  The slot is reported through the arm call
-+	 * because a pointer to the wrong alias is an abort inside the panic path,
-+	 * which is exactly the silence this channel exists to break.
++	/* Nothing may depend on eMMC being up to record how the boot died.  The six
++	 * blocks past the framebuffer alias were the obvious place and QEMU showed
++	 * the table has none to give - the kernel's own mappings fill the rest of it,
++	 * forward and back.  The framebuffer alias spans 12 MiB while the console
++	 * draws into 3.5 MiB, so the last of those blocks is already ours to hand to
++	 * another page.  A slot this table certainly gives beats a pointer into a
++	 * mapping that goes away with TTBR0, which is an abort inside the panic path
++	 * and the exact silence this channel exists to break.
 +	 */
 +	if (first + 7 <= TTE_PGENTRIES) {
-+		unsigned int slot = TTE_PGENTRIES;
-+		unsigned int i;
-+
-+		for (i = first; i-- > 0;) {
-+			if (l2[i] == ARM_TTE_EMPTY) {
-+				slot = i;
-+				break;
-+			}
-+		}
-+		for (i = first + 6; slot == TTE_PGENTRIES && i < TTE_PGENTRIES; i++) {
-+			if (l2[i] == ARM_TTE_EMPTY) {
-+				slot = i;
-+				break;
-+			}
-+		}
-+		if (slot < TTE_PGENTRIES) {
-+			l2[slot] = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
-+			    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
-+			    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
-+			    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
-+			__asm__ volatile("dsb ishst" ::: "memory");
-+			sweet_early_ram_va = (va - ((vm_map_address_t)first * ARM_TT_L2_SIZE)) +
-+			    ((vm_map_address_t)slot << ARM_TT_L2_SHIFT) + SWEET_EARLY_RAM_PAGE_OFF;
-+			sweet_early_ram_aux = ((uint64_t)first << 16) | slot;
-+			sweet_early_ram_mapped = true;
-+		} else {
-+			sweet_early_ram_aux = ((uint64_t)first << 16) | 0xffff;
-+		}
++		l2[first + 5] = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++		__asm__ volatile("dsb ishst" ::: "memory");
++		sweet_early_ram_va = va + (5 * ARM_TT_L2_SIZE) + SWEET_EARLY_RAM_PAGE_OFF;
++		sweet_early_ram_aux = ((uint64_t)first << 16) | (first + 5);
++		sweet_early_ram_mapped = true;
 +	} else {
 +		sweet_early_ram_aux = 0xffffffff;
 +	}
  	__asm__ volatile("dsb ishst" ::: "memory");
  	sweet_early_fb_mapped = true;
  }
-@@ -1902,6 +1961,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -1902,6 +1943,14 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	vm_offset_t      ptpage_vaddr;
  	vm_map_address_t dynamic_memory_begin;
  
@@ -101,7 +85,7 @@ index 9a51f14..e7b209b 100644
  	/*
  	 * Get the virtual and physical kernel-managed memory base from boot_args.
  	 */
-@@ -2233,6 +2300,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+@@ -2233,6 +2282,12 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
  	} else {
  		sweet_early_disable();
  	}
@@ -115,20 +99,20 @@ index 9a51f14..e7b209b 100644
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
  	sweet_early_relocate(SWEET_EARLY_FB_VA);
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 37e7376..60ce933 100644
+index e160b46..10fdf32 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -702,6 +702,16 @@ Ltopaz_fb_block:
+@@ -735,6 +735,16 @@ Ltopaz_fb_block:
  	add		x11, x11, #(ARM_TT_L2_SIZE)
  	subs	x12, x12, #1
  	b.ne	Ltopaz_fb_block
 +	/* land (Redmi 3S): the retained RAM console page in the slot the loop just
-+	 * stepped past, i.e. VA 0x60c00000 for PA 0xb0600000, so the console is
++	 * stepped past, i.e. VA 0x60c00000 for PA 0x86600000, so the console is
 +	 * recordable from the first line of arm_vm_init onward.  Non-cacheable for
 +	 * the same reason as the framebuffer: what has to survive the reset is the
 +	 * copy in DRAM, not one in a cache that gets invalidated by it.
 +	 */
-+	MOV64	x10, 0xb0600000
++	MOV64	x10, 0x86600000
 +	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 +	orr		x11, x11, x10
 +	str		x11, [x13]

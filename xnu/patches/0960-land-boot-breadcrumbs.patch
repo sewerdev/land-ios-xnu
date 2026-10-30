@@ -9,7 +9,7 @@ into dip blocks 32..47 on the next boot, so the stage mask names the
 interval the boot stopped in.
 ---
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..f50c9b0 100644
+index 42362c5..657a7b4 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -340,6 +340,21 @@ void
@@ -27,15 +27,15 @@ index 42362c5..f50c9b0 100644
 +	/* The bootstrap alias start.s made for the framebuffer console is live
 +	 * from here on, so the console can be mirrored into DRAM two functions
 +	 * before arm_vm_init: whatever kills this boot leaves its own panic text
-+	 * behind.  0x60df0000 is SWEET_EARLY_RAM_BOOT_VA in arm_vm_init.c.
++	 * behind.  0x60dff000 is SWEET_EARLY_RAM_BOOT_VA in arm_vm_init.c.
 +	 */
-+	land_ram_console_arm(0x60df0000ULL, "arm_init on the bootstrap alias", 0);
++	land_ram_console_arm(0x60dff000ULL, "arm_init on the bootstrap alias", 0);
 +#endif
  	unsigned int    maxmem;
  	uint32_t        memsize;
  	uint64_t        xmaxmem;
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 60ce933..f79bfe2 100644
+index 60ce933..bffa8c5 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -451,6 +451,27 @@ start_cpu:
@@ -74,13 +74,13 @@ index 60ce933..f79bfe2 100644
 +	/* Stage 1: the kernel image is running.  MMU off, so the page is reached
 +	 * at its physical address.  The boot count carries over resets, which is
 +	 * how a stale page from an older run is recognised. */
-+	MOV64	x1, 0xb07e0000
++	MOV64	x1, 0x867fe000
 +	MOV64	x2, 0x31445242444E414C		/* "LANDBRD1" */
 +	str		x2, [x1]
 +	ldr		x2, [x1, #8]
 +	add		x2, x2, #1
 +	str		x2, [x1, #8]
-+	land_brd 1, 0xb07e0000
++	land_brd 1, 0x867fe000
 +#endif
  
  #if defined(SWEET)
@@ -92,7 +92,7 @@ index 60ce933..f79bfe2 100644
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	/* Stage 2: the bootstrap tables are written; what comes next in
 +	 * common_start is TCR/TTBR/MAIR and the MMU enable itself. */
-+	land_brd 2, 0xb07e0000
++	land_brd 2, 0x867fe000
 +#endif
  	b		common_start
  
@@ -103,9 +103,9 @@ index 60ce933..f79bfe2 100644
  	isb		sy
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	/* Stage 3: translations are live.  From here the page is reached through
-+	 * the alias in the VA=PA table, 0x60c00000 + the block offset of 0xb07e0000.
++	 * the alias in the VA=PA table: 0x60c00000 (PA 0x86600000) + 0x1fe000.
 +	 */
-+	land_brd 3, 0x60de0000
++	land_brd 3, 0x60dfe000
 +#endif
  
  #if !VMAPPLE && !defined(SWEET)
@@ -119,8 +119,8 @@ index 60ce933..f79bfe2 100644
 +	 * actually depend on: MIDR_EL1 at +32 and CurrentEL at +40.
 +	 */
 +	mrs		x2, CurrentEL
-+	land_brd 4, 0x60de0000
-+	MOV64	x1, 0x60de0000
++	land_brd 4, 0x60dfe000
++	MOV64	x1, 0x60dfe000
 +	str		x12, [x1, #32]
 +	str		x2, [x1, #40]
 +#endif
@@ -128,7 +128,7 @@ index 60ce933..f79bfe2 100644
  	APPLY_TUNABLES x12, x13, x14
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	/* Stage 5: the per-SoC tunables (Apple registers) are behind us. */
-+	land_brd 5, 0x60de0000
++	land_brd 5, 0x60dfe000
 +#endif
  
  
@@ -140,7 +140,7 @@ index 60ce933..f79bfe2 100644
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	/* Stage 6: whatever HAS_CLUSTER does to CPU_OVRD is done, and the branch
 +	 * to arm_init is the next instruction that matters. */
-+	land_brd 6, 0x60de0000
++	land_brd 6, 0x60dfe000
 +#endif
 +
  	// If x21 != 0, we're doing a warm reset, so we need to trampoline to the kernel pmap.
