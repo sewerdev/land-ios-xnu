@@ -511,6 +511,16 @@ static unsigned int land_ram_used;              /* write cursor, mod ring size *
 static uint64_t land_ram_total;
 static uint64_t land_ram_boot;
 static unsigned int land_ram_lines;
+/*
+ * When the alias comes from a slot the kernel table had free (patch 0963) rather
+ * than from the bootstrap table, the block can be taken back at any time.  The
+ * address of that page-table entry and the value we wrote there are kept, and
+ * every line end re-reads them: a console that outlives its own mapping writes
+ * into whatever the kernel put in its place, which is the bug QEMU showed when
+ * this page was inside managed RAM and the allocator handed it to a stack.
+ */
+static volatile uint64_t *land_ram_slot;
+static uint64_t land_ram_expect;
 
 /*
  * Cold boot stages, the C half of what start.s breadcrumbs (patch 0960).  The
@@ -548,6 +558,12 @@ static void
 land_ram_tap(char c)
 {
 	if (land_ram == NULL) {
+		return;
+	}
+	if (c == '\n' && land_ram_slot != NULL && *land_ram_slot != land_ram_expect) {
+		land_ram_slot = NULL;
+		land_ram = NULL;
+		land_brd = NULL;
 		return;
 	}
 	land_ram[LAND_RAM_HDR + land_ram_used] = c;
@@ -613,6 +629,7 @@ land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux)
 	if (va == 0) {
 		land_ram = NULL;
 		land_brd = NULL;
+		land_ram_slot = NULL;
 	} else {
 		land_boot_mark(8);
 	}
@@ -659,6 +676,44 @@ land_cpumap_report(uint32_t want, uint64_t mpidr, int num_cpus, int max_cpu_id,
 		land_ram_hex(ids[i], 8);
 	}
 	land_console_tap('\n');
+}
+
+/*
+ * Which guard in sweet_early_map_final() stopped the kernel alias, and what it
+ * saw there: "no l1"/"no range"/"busy slot" with the entry value, then the
+ * fallback's "late slot"/"late none".  Tapped rather than kprint-ed, so the
+ * answer arrives in retained DRAM on a boot nobody is watching.
+ */
+void
+land_vm_alias_report(const char *why, uint64_t a, uint64_t b)
+{
+	static const char lbl[] = "land alias: ";
+	const char *p;
+
+	for (p = lbl; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	for (p = why; *p != '\0'; p++) {
+		land_console_tap(*p);
+	}
+	land_console_tap(' ');
+	land_ram_hex(a, 16);
+	land_console_tap(' ');
+	land_ram_hex(b, 16);
+	land_console_tap('\n');
+}
+
+/*
+ * The page-table entry that makes the current alias, so the tap can notice the
+ * day it stops being ours.  Called by land_console_map_kernel() right after it
+ * writes the descriptor.
+ */
+void
+land_ram_console_slot(uint64_t slot_va, uint64_t expect)
+{
+	land_ram_slot = (volatile uint64_t *)(uintptr_t)slot_va;
+	land_ram_expect = expect;
+	__asm__ volatile("dsb ish" ::: "memory");
 }
 
 /* ------------------------------------------------------------------ console
