@@ -108,9 +108,11 @@ jobs:
           cd "$WORK"
           SRC=$(cat src.dir)
           df -h . | tail -1
-          # The image has to be dd-able onto land's userdata partition, which is
-          # 5635047424 bytes, so the volume is sized for that and not for the
-          # 6 GiB the whole root would want.
+          # land userdata is mmcblk0p49: LBA 9700368, which is what the kernel
+          # calls the root window, and 26301931008 bytes - the 5635047424 figure
+          # in the reader is the APFS container that used to sit there.  The
+          # default volume stays small because every MiB of it is a MiB to
+          # download and a MiB to write over USB.
           SIZE_MB=${{ inputs.size_mb }}
           # macOS 14 runners ship no newfs_hfs and hdiutil has no raw -type, so
           # build a UDIF with a case-sensitive HFS+ volume (iOS paths are
@@ -186,11 +188,10 @@ jobs:
           dd if="$VD" of=root.hfs bs=8m
           hdiutil detach "$VD" -force || true
           ls -lh root.hfs
-          # land userdata is 5635047424 bytes; an image that does not fit is
-          # worse than useless, it is a partially flashed partition
+          # an image larger than the partition would leave a half-written root
           SZ=$(wc -c < root.hfs | tr -d ' ')
           echo "root.hfs $SZ bytes"
-          [ "$SZ" -le 5635047424 ] || { echo "image bigger than the userdata partition"; exit 1; }
+          [ "$SZ" -le 26301931008 ] || { echo "image bigger than the userdata partition"; exit 1; }
           # verify the raw file by mounting it as a plain disk image
           hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage root.hfs > verify.txt
           cat verify.txt
