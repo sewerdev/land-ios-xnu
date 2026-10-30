@@ -1,0 +1,26 @@
+land: do not dereference the zero per-CPU base for a timebase
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a1f2a91..4fdefca 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2089,6 +2089,19 @@ uint64_t
+ ml_get_timebase()
+ {
+ 	uint64_t clock, timebase;
++	uint64_t percpu_base = __builtin_arm_rsr64("TPIDR_EL1");
++
++	/*
++	 * land (Redmi 3S): percpu_init() installs the per-CPU base in TPIDR_EL1,
++	 * but the boot RNG and the panic path ask for a timebase before that and
++	 * dereference the zero base.  The abort is taken synchronously, the panic
++	 * handler then calls this very function again, and the boot dies printing
++	 * nothing.  Without a per-CPU base there is no cpu_base_timebase delta to
++	 * add, so return the raw counter instead.
++	 */
++	if (percpu_base == 0) {
++		return ml_get_hwclock();
++	}
+ 
+ 	//the retry is for the case where S2R catches us in the middle of this. see rdar://77019633
+ 	do {
