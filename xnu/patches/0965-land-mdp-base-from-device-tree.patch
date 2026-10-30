@@ -11,7 +11,7 @@ panel work; sweetmdp=0 turns the window off for a boot that must not
 touch MMIO.
 ---
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 1d3ee17..6eea3b1 100644
+index 1d3ee17..73d151f 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -107,6 +107,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -52,9 +52,9 @@ index 1d3ee17..6eea3b1 100644
 +		d = OSDynamicCast(OSData, provider->getProperty("mdp-base"));
 +		if (d != NULL) {
 +			if (d->getLength() == sizeof(uint64_t)) {
-+				base = *(const uint64_t *)d->getBytes();
++				base = *(const uint64_t *)d->getBytesNoCopy();
 +			} else if (d->getLength() == sizeof(uint32_t)) {
-+				base = *(const uint32_t *)d->getBytes();
++				base = *(const uint32_t *)d->getBytesNoCopy();
 +			}
 +		}
 +	}
