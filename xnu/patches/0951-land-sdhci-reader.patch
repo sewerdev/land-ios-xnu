@@ -26,7 +26,7 @@ index bb2a2bf..2b0c74c 100644
  	struct proc_ro_data kernproc_ro_data = {
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..b4129df
+index 0000000..d88a3b6
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
 @@ -0,0 +1,804 @@
@@ -633,7 +633,7 @@ index 0000000..b4129df
 +		land_ram = NULL;
 +		land_brd = NULL;
 +	} else {
-+		land_boot_mark(5);
++		land_boot_mark(8);
 +	}
 +	__asm__ volatile("dsb ishst" ::: "memory");
 +}

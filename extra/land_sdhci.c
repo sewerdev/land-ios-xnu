@@ -601,7 +601,7 @@ land_ram_console_arm(uint64_t va, const char *tag, uint64_t aux)
 		land_ram = NULL;
 		land_brd = NULL;
 	} else {
-		land_boot_mark(5);
+		land_boot_mark(8);
 	}
 	__asm__ volatile("dsb ishst" ::: "memory");
 }

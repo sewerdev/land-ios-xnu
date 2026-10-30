@@ -9,7 +9,7 @@ into dip blocks 32..47 on the next boot, so the stage mask names the
 interval the boot stopped in.
 ---
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index 42362c5..3e84150 100644
+index 42362c5..1ff7747 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -340,6 +340,14 @@ void
@@ -19,16 +19,16 @@ index 42362c5..3e84150 100644
 +#if defined(SWEET) && defined(TOPAZ_4K)
 +	extern void land_boot_mark(unsigned int stage);
 +
-+	/* Stage 4: the assembly boot path finished, so the exception vectors,
-+	 * TCR, TTBR and SCTLR all took effect on this hardware.
++	/* Stage 7: the assembly boot path finished, so the exception vectors,
++	 * TCR, TTBR, SCTLR and the tunables all took effect on this hardware.
 +	 */
-+	land_boot_mark(4);
++	land_boot_mark(7);
 +#endif
  	unsigned int    maxmem;
  	uint32_t        memsize;
  	uint64_t        xmaxmem;
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 60ce933..182af98 100644
+index 60ce933..f79bfe2 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -451,6 +451,27 @@ start_cpu:
@@ -103,3 +103,39 @@ index 60ce933..182af98 100644
  
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
+@@ -904,8 +948,22 @@ common_start:
+ 
+ 	// Read MIDR before start of per-SoC tunables
+ 	mrs x12, MIDR_EL1
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 4, plus what the tunable lookup and any Apple-register trap
++	 * actually depend on: MIDR_EL1 at +32 and CurrentEL at +40.
++	 */
++	mrs		x2, CurrentEL
++	land_brd 4, 0x60de0000
++	MOV64	x1, 0x60de0000
++	str		x12, [x1, #32]
++	str		x2, [x1, #40]
++#endif
+ 
+ 	APPLY_TUNABLES x12, x13, x14
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 5: the per-SoC tunables (Apple registers) are behind us. */
++	land_brd 5, 0x60de0000
++#endif
+ 
+ 
+ #if HAS_CLUSTER
+@@ -915,6 +973,12 @@ common_start:
+ 	msr		CPU_OVRD, x9
+ #endif
+ 
++#if defined(SWEET) && defined(TOPAZ_4K)
++	/* Stage 6: whatever HAS_CLUSTER does to CPU_OVRD is done, and the branch
++	 * to arm_init is the next instruction that matters. */
++	land_brd 6, 0x60de0000
++#endif
++
+ 	// If x21 != 0, we're doing a warm reset, so we need to trampoline to the kernel pmap.
+ 	cbnz	x21, Ltrampoline
+ 
