@@ -26,10 +26,10 @@ index bb2a2bf..2b0c74c 100644
  	struct proc_ro_data kernproc_ro_data = {
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..f79f101
+index 0000000..4e137e8
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,764 @@
 +/*
 + * land_sdhci.c - eMMC access for the Redmi 3S (land, MSM8937) from XNU.
 + *
@@ -551,6 +551,11 @@ index 0000000..f79f101
 + * still tell which run a page came from after the pointer moves.  The tag goes
 + * into the ring as the first thing the page ever hears, so a boot that dies
 + * right here still says which of the two addresses it died writing to.
++ *
++ * va == 0 means the kernel alias never came up: the bootstrap mapping is about
++ * to be torn down with TTBR0, so write the farewell through it and then stop
++ * touching memory that no longer exists.  A stale pointer here is an abort
++ * inside the panic path, which is how a boot stops reporting anything at all.
 + */
 +void
 +land_ram_console_arm(uint64_t va, const char *tag)
@@ -558,11 +563,13 @@ index 0000000..f79f101
 +	volatile uint64_t *h = (volatile uint64_t *)(uintptr_t)va;
 +	const char *p;
 +
-+	land_ram = (volatile char *)(uintptr_t)va;
-+	if (land_ram_boot == 0) {
-+		land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
++	if (va != 0) {
++		land_ram = (volatile char *)(uintptr_t)va;
++		if (land_ram_boot == 0) {
++			land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
++		}
++		land_ram_header();
 +	}
-+	land_ram_header();
 +	for (p = "ram console armed: "; *p != '\0'; p++) {
 +		land_ram_tap(*p);
 +	}
@@ -570,6 +577,9 @@ index 0000000..f79f101
 +		land_ram_tap(*p);
 +	}
 +	land_ram_tap('\n');
++	if (va == 0) {
++		land_ram = NULL;
++	}
 +	__asm__ volatile("dsb ishst" ::: "memory");
 +}
 +

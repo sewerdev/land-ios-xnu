@@ -519,6 +519,11 @@ land_ram_header(void)
  * still tell which run a page came from after the pointer moves.  The tag goes
  * into the ring as the first thing the page ever hears, so a boot that dies
  * right here still says which of the two addresses it died writing to.
+ *
+ * va == 0 means the kernel alias never came up: the bootstrap mapping is about
+ * to be torn down with TTBR0, so write the farewell through it and then stop
+ * touching memory that no longer exists.  A stale pointer here is an abort
+ * inside the panic path, which is how a boot stops reporting anything at all.
  */
 void
 land_ram_console_arm(uint64_t va, const char *tag)
@@ -526,11 +531,13 @@ land_ram_console_arm(uint64_t va, const char *tag)
 	volatile uint64_t *h = (volatile uint64_t *)(uintptr_t)va;
 	const char *p;
 
-	land_ram = (volatile char *)(uintptr_t)va;
-	if (land_ram_boot == 0) {
-		land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
+	if (va != 0) {
+		land_ram = (volatile char *)(uintptr_t)va;
+		if (land_ram_boot == 0) {
+			land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
+		}
+		land_ram_header();
 	}
-	land_ram_header();
 	for (p = "ram console armed: "; *p != '\0'; p++) {
 		land_ram_tap(*p);
 	}
@@ -538,6 +545,9 @@ land_ram_console_arm(uint64_t va, const char *tag)
 		land_ram_tap(*p);
 	}
 	land_ram_tap('\n');
+	if (va == 0) {
+		land_ram = NULL;
+	}
 	__asm__ volatile("dsb ishst" ::: "memory");
 }
 
