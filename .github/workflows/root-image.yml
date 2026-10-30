@@ -124,11 +124,18 @@ jobs:
           DIR=/Volumes/iOS
           test -d "$DIR" || { echo "volume did not automount"; exit 1; }
           # Things the first boot does not need: downloaded asset catalogs,
-          # fonts cache, wallpapers, per-device firmware bundles.  rsync gives
-          # up with errno 34 (Result too large) on a compiled .car and with
-          # EACCES on the DMG's .file, neither of which may stop the build -
-          # exit 24 just means some files were skipped.
-          EXCLUDES=()
+          # fonts cache, wallpapers, per-device firmware bundles.  Individual
+          # compiled catalogs and ML weight blobs fail with errno 34 (Result too
+          # large) while being written into the HFS+ volume - gigabytes are
+          # still free at that point, so it is the file, not the space - and the
+          # rsync receiver dies on them, which costs the whole copy.  They are
+          # also the biggest things in the root, so skip everything over 32 MiB:
+          # nothing launchd or dyld needs is anywhere near that.
+          #
+          # macOS still ships rsync 2.6.9 (see its own error paths in the log),
+          # which has no ** patterns and no --max-size, so the size cap has to
+          # be a list built from the source with find(1).
+          EXCLUDES=( --exclude '*.car' )
           if [ "${{ inputs.subset }}" != all ]; then
             EXCLUDES=(
               --exclude 'System/Library/AssetsV2/'
@@ -141,16 +148,34 @@ jobs:
               --exclude 'System/Library/LocationBundles/'
               --exclude 'System/Library/PrivateFrameworks/AssistantServices/'
               --exclude '*.car'
+              --exclude '*espresso*'
+              --exclude '*.mlmodel*'
             )
           fi
+          find "$SRC" -xdev -type f -size +32M 2>/dev/null | sed "s#^$SRC/##" > big.txt || true
+          echo "files over 32 MiB skipped: $(wc -l < big.txt)"
+          head -20 big.txt
+          EXCLUDES+=( --exclude-from=big.txt )
           # shellcheck disable=SC2068
           rsync -a --ignore-errors ${EXCLUDES[@]+"${EXCLUDES[@]}"} "$SRC"/ "$DIR"/ && rc=0 || rc=$?
-          if [ "$rc" -gt 24 ]; then echo "rsync failed with $rc"; exit 1; fi
-          echo "rsync returned $rc (0 = clean, 24 = some files skipped)"
+          echo "rsync returned $rc (0 = clean, 24 = files skipped)"
+          df -h "$DIR" | tail -1
+          if [ "$rc" -gt 24 ]; then
+            echo "rsync died with $rc; that is the receiver losing the volume, not a skipped file"
+            exit 1
+          fi
+          # The size cap is a blunt instrument, so name what it must not have
+          # cost.  If one of these is gone the image cannot boot and the copy
+          # rules have to change, not the check.
+          for need in sbin/launchd usr/lib/dyld usr/libexec/securityd \
+                      System/Library/CoreServices/SpringBoard.app/SpringBoard \
+                      System/Library/Frameworks/UIKit.framework/UIKit \
+                      System/Library/Frameworks/Foundation.framework/Foundation; do
+            test -f "$DIR/$need" || { echo "missing from the image: $need"; exit 1; }
+          done
+          echo "boot set present"
           mkdir -p "$DIR/dev" "$DIR/proc" "$DIR/tmp"
           sync
-          df -h "$DIR" | tail -1
-          df -k "$DIR" | tail -1 | awk '{print "volume avail KiB:", $4}'
           hdiutil detach /Volumes/iOS
           # read the decoded volume back out: with -layout NONE the whole image
           # is the file system, so the device dump is exactly what the kernel
