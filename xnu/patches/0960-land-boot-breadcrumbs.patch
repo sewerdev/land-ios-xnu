@@ -35,7 +35,7 @@ index 42362c5..657a7b4 100644
  	uint32_t        memsize;
  	uint64_t        xmaxmem;
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index ace7183..77e3b25 100644
+index ace7183..cc7e0e8 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -451,6 +451,31 @@ start_cpu:
@@ -54,7 +54,7 @@ index ace7183..77e3b25 100644
 + * MOV64 because the integrated assembler will not expand a plain "mov x1,
 + * #0x867fe000": that is neither a single movz nor a logical immediate, and the
 + * build dies on the macro instantiation.
-+ */
++ *
 + * Layout of the page: +0 magic, +8 boot count, +16 last stage, +24 OR of 1<<stage.
 + */
 +.macro land_brd n, addr
