@@ -1,0 +1,21 @@
+land: name the range and caller when pmap_map_bd cannot map it
+
+A bare panic("pmap_map_bd") on the phone tells us only that a boot-time device
+mapping failed.  Report the virtual target, the physical window and who asked,
+so an unattended boot identifies the mapping that does not fit the boot window.
+---
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index c240258..6b241d3 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -1882,7 +1882,9 @@ pmap_map_bd(
+ 	while (paddr < end) {
+ 		ptep = pmap_pte(kernel_pmap, vaddr);
+ 		if (ptep == PT_ENTRY_NULL) {
+-			panic("pmap_map_bd");
++			panic("pmap_map_bd: no L2 table for 0x%llx mapping 0x%llx..0x%llx (from %p)",
++			    (unsigned long long)vaddr, (unsigned long long)paddr,
++			    (unsigned long long)end, __builtin_return_address(0));
+ 		}
+ 		assert(!ARM_PTE_IS_COMPRESSED(*ptep, ptep));
+ 		write_pte_strong(ptep, tmplate);

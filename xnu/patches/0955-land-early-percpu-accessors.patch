@@ -1,0 +1,44 @@
+land: per-CPU accessors that do not fault before the boot thread exists
+
+current_percpu_base() and cpu_number() are reached by the panic and console paths,
+which on land run before the boot thread installs a per-CPU base.  Both then
+dereferenced a null pointer, the abort was taken inside the panic handler, and the
+boot died without printing the message that would have explained it.
+---
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+index abf7ec7..8cd627a 100644
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -816,13 +816,31 @@ cpu_threadtype(void)
+ int
+ cpu_number(void)
+ {
++	/* land: no per-CPU datap exists until percpu_init() has run on this CPU */
++	if (__builtin_arm_rsr64("TPIDR_EL1") == 0) {
++		return 0;
++	}
+ 	return getCpuDatap()->cpu_number;
+ }
+ 
+ vm_offset_t
+ current_percpu_base(void)
+ {
+-	return current_thread()->machine.pcpu_data_base;
++	thread_t        thread = current_thread();
++	uint64_t        percpu_base = __builtin_arm_rsr64("TPIDR_EL1");
++
++	/*
++	 * land (Redmi 3S): the console and panic paths ask for per-CPU data before the
++	 * boot thread has a base of its own, and dereferencing null there takes a second
++	 * synchronous abort inside the panic handler.  Fall back to the boot CPU.
++	 */
++	if (thread == THREAD_NULL) {
++		if (percpu_base != 0) {
++			return percpu_base;
++		}
++		return (vm_offset_t)cpu_datap(0) - __PERCPU_ADDR(cpu_data);
++	}
++	return thread->machine.pcpu_data_base;
+ }
+ 
+ vm_offset_t
