@@ -1,0 +1,191 @@
+name: root-image
+
+# The open xnu-8796 tree has no APFS filesystem (only kern_apfs_reflock), while
+# HFS+ is built in by the sweet patch set.  This job converts a DMG out of an
+# IPSW into a raw HFS+ image that the kernel can actually mount from the phone's
+# userdata partition, and hands it back in 400 MB parts (a single artifact file
+# over ~500 MB is not reliable).  Assemble locally:
+#   cat root-hfs.part-* > root.hfs
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: IPSW to take the DMG from
+        default: "https://downloadsapplesrv.com/13/iPhone_8/iPhone11,2_16.7.16_Dev_Restore.ipsw"
+      dmg_member:
+        description: DMG member inside the IPSW
+        default: "087-86698-044.dmg"
+      image_gib:
+        description: HFS+ image size in GiB
+        default: "6"
+      subset:
+        description: "all = whole volume; small = boot set (sbin/launchd, usr/lib/dyld, dyld caches, /usr/lib, minimal /usr/libexec)"
+        type: choice
+        options:
+          - small
+          - all
+        default: small
+
+concurrency:
+  group: root-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  hfs:
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      WORK: ${{ github.workspace }}/work
+    steps:
+      - name: Size the disk before anything else
+        run: df -h /System/Volumes/Data | tail -1
+
+      - name: Fetch the DMG member by HTTP range
+        # The IPSW stores its DMGs uncompressed, so a range request over the
+        # central directory yields the whole member without downloading 5 GB.
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK"
+          python3 - "$WORK" <<'PY'
+          import os, re, struct, subprocess, sys, urllib.request, zipfile
+          work = sys.argv[1]
+          url = os.environ['IPSW_URL']
+          member = os.environ['DMG_MEMBER']
+          # 1) read the central directory from the tail of the remote zip
+          def get(start, end):
+              req = urllib.request.Request(url, headers={'Range': 'bytes=%d-%d' % (start, end)})
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return r.read()
+          req = urllib.request.Request(url, headers={'Range': 'bytes=-66000'})
+          with urllib.request.urlopen(req, timeout=120) as r:
+              total = int(r.headers['Content-Range'].split('/')[1])
+              tail = r.read()
+          i = len(tail) - 22
+          while i >= 0 and struct.unpack_from('<I', tail, i)[0] != 0x06054b50:
+              i -= 1
+          _, _, _, _, cd_size, cd_off, _ = struct.unpack_from('<IHHIIII', tail, i)[0:7]
+          cd = struct.unpack_from('<I', tail, i - 8)[0]
+          if cd == 0x07064b50:                      # zip64 end-of-central-directory locator
+              loc = struct.unpack_from('<IIQI', tail, i - 20)[0]
+              zrec = get(i - 20, i - 20 + 55)
+              cd_off = struct.unpack_from('<Q', zrec, 48)[0]
+              cd_size = struct.unpack_from('<Q', zrec, 40)[0]
+          central = get(cd_off, cd_off + cd_size - 1)
+          p, found = 0, None
+          while p + 46 <= len(central):
+              if struct.unpack_from('<I', central, p)[0] != 0x02014b50:
+                  break
+              hn, ln, ce = struct.unpack_from('<HHH', central, p + 28)
+              ex, cm = struct.unpack_from('<HH', central, p + 30)
+              name = central[p + 46:p + 46 + hn].decode('utf-8')
+              hdr_off = struct.unpack_from('<I', central, p + 42)[0]
+              if struct.unpack_from('<I', central, p + 0)[0] == 0x02014b50 and name == member:
+                  found = (hdr_off, struct.unpack_from('<Q', central, p + 20)[0])
+                  if struct.unpack_from('<I', central, p + 24)[0] == 0xFFFFFFFF:
+                      extra = central[p + 46 + hn:p + 46 + hn + ex]
+                      e = 0
+                      while e + 4 <= len(extra):
+                          tag, sz = struct.unpack_from('<HH', extra, e)
+                          if tag == 0x0001 and sz >= 8:
+                              found = (found[0], struct.unpack_from('<Q', extra, e + 4)[0])
+                          e += 4 + sz
+              p += 46 + hn + ln + ce
+          if not found:
+              raise SystemExit('%s not in the central directory' % member)
+          hdr_off, uncomp = found
+          hdr = get(hdr_off, hdr_off + 29)
+          assert hdr[:4] == b'PK\x03\x04', 'local header signature'
+          hn, ln = struct.unpack_from('<HH', hdr, 26)
+          data_off = hdr_off + 30 + hn + ln
+          method = struct.unpack_from('<H', hdr, 8) [0]
+          if method != 0:
+              raise SystemExit('member is compressed (method %d); a range fetch needs a stored member' % method)
+          end = min(data_off + uncomp - 1, total - 1)
+          print('%s: data at %d, %d bytes' % (member, data_off, end - data_off + 1))
+          out = os.path.join(work, member)
+          CH = 1 << 26
+          with open(out, 'wb') as f:
+              for s in range(data_off, end + 1, CH):
+                  e = min(s + CH - 1, end)
+                  chunk = get(s, e)
+                  f.write(chunk)
+                  print('  %d/%d MB' % (e - data_off, end - data_off), flush=True)
+          got = os.path.getsize(out)
+          if got != uncomp:
+              raise SystemExit('short fetch: %d of %d' % (got, uncomp))
+          PY
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+          DMG_MEMBER: ${{ inputs.dmg_member }}
+
+      - name: Expand the UDIF and read the container
+        # hdiutil decodes UDIF (including LZFSE chunks) and macOS mounts APFS
+        # natively, so the volume appears read-only without any fuse helper.
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          hdiutil expand -format RAW "./${{ inputs.dmg_member }}" -o container.raw
+          ls -l container.raw
+          hdiutil attach -readonly -nomount container.raw > devs.txt || true
+          cat devs.txt
+          # the APFS container's volumes show up as /dev/diskN;s1 ... ; mount the last one
+          VOL=$(echo "$(cat devs.txt)" | grep -oE '/dev/disk[s0-9]+' | tail -1)
+          diskutil list
+          mkdir -p mnt
+          for cand in $(awk '{print $NF}' devs.txt | grep '^/dev/disk' | tac); do
+            if mount -t apfs -o ro "$cand" mnt 2>/dev/null; then VOL="$cand"; echo "mounted $VOL"; break; fi
+          done
+          test -d mnt/System/Library || { ls -l mnt; exit 1; }
+          du -sh mnt
+
+      - name: Build the HFS+ image and copy the payload
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          GIB=${{ inputs.image_gib }}
+          dd if=/dev/zero of=root.hfs bs=1m count=$((GIB * 1024))
+          # case-sensitive: iOS paths are case-sensitive and dyld expects that
+          newfs_hfs -v -C utf-8 iOS root.hfs
+          DEV=$(hdiutil attach -nomount root.hfs)
+          DIR=$(mktemp -d)
+          mount -t hfs "$DEV" "$DIR"
+          if [ "${{ inputs.subset }}" = all ]; then
+            /bin/cp -aX mnt/. "$DIR"/
+          else
+            for p in sbin/launchd usr/lib/dyld usr/lib usr/libexec System/Library/Caches System/Library/CoreServices System/Library/Frameworks System/Library/PrivateFrameworks System/Library/Preferences private etc; do
+              [ -e "mnt/$p" ] || continue
+              mkdir -p "$DIR/$(dirname "$p")"
+              /bin/cp -aX "mnt/$p" "$DIR/$p" 2>/dev/null || echo "copy skipped: $p"
+            done
+            mkdir -p "$DIR/dev" "$DIR/proc"
+          fi
+          sync
+          df -h "$DIR"
+          umount "$DIR"
+          hdiutil detach "$DEV"
+          ls -l root.hfs
+          # 7-Zip is not on the runner; verify by re-attaching read-only
+          hdiutil attach -readonly -nomount root.hfs > verify.txt
+          VDEV=$(awk '{print $NF}' verify.txt | head -1)
+          DIR2=$(mktemp -d); mount -t hfs -o ro "$VDEV" "$DIR2"
+          echo "verification:"; ls "$DIR2" | head; du -sh "$DIR2"
+          umount "$DIR2"; hdiutil detach "$VDEV"
+
+      - name: Split and upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-hfs
+          path: |
+            work/root.hfs.part-*
+          if-no-files-found: error
+
+      - name: Report
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          split -b 400m root.hfs root.hfs.part-
+          ls -l root.hfs.part-* | awk '{print $9, $5}'
+          shasum -a 256 root.hfs | tee root.hfs.sha256

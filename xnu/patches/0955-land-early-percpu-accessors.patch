@@ -6,10 +6,10 @@ dereferenced a null pointer, the abort was taken inside the panic handler, and t
 boot died without printing the message that would have explained it.
 ---
 diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
-index abf7ec7..8cd627a 100644
+index abf7ec7..365e9aa 100644
 --- a/osfmk/arm/cpu_common.c
 +++ b/osfmk/arm/cpu_common.c
-@@ -816,13 +816,31 @@ cpu_threadtype(void)
+@@ -816,13 +816,29 @@ cpu_threadtype(void)
  int
  cpu_number(void)
  {
@@ -28,15 +28,13 @@ index abf7ec7..8cd627a 100644
 +	uint64_t        percpu_base = __builtin_arm_rsr64("TPIDR_EL1");
 +
 +	/*
-+	 * land (Redmi 3S): the console and panic paths ask for per-CPU data before the
-+	 * boot thread has a base of its own, and dereferencing null there takes a second
-+	 * synchronous abort inside the panic handler.  Fall back to the boot CPU.
++	 * land (Redmi 3S): the console and panic paths ask for per-CPU data before
++	 * the boot thread has a base of its own, and dereferencing null there takes a
++	 * second synchronous abort inside the panic handler.  Report "no per-CPU area"
++	 * rather than inventing a base from cpu_data arrays that are not filled yet.
 +	 */
 +	if (thread == THREAD_NULL) {
-+		if (percpu_base != 0) {
-+			return percpu_base;
-+		}
-+		return (vm_offset_t)cpu_datap(0) - __PERCPU_ADDR(cpu_data);
++		return (vm_offset_t)percpu_base;
 +	}
 +	return thread->machine.pcpu_data_base;
  }

@@ -1,0 +1,60 @@
+land: make a panic before per-CPU state visible
+
+Mirror the early console into dip (it sits below uart_putc, so it also catches
+output the serial layer never sees) and print the panic text there before the
+debugger bookkeeping that dereferences per-CPU state which does not exist yet.
+---
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index fa3e8fc..2b3795a 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -43,9 +43,13 @@ sweet_early_clear_row(void)
+ 	}
+ }
+ 
++void land_console_tap(char c);
++
+ void
+ sweet_early_putc(char c)
+ {
++	land_console_tap(c);
++
+ 	if (early_disabled) {
+ 		return;
+ 	}
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..90b0052 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -710,6 +710,9 @@ Assert(
+ boolean_t
+ debug_is_current_cpu_in_panic_state(void)
+ {
++	if (current_thread() == THREAD_NULL) {
++		return FALSE;
++	}
+ 	return current_debugger_state()->db_entry_count > 0;
+ }
+ 
+@@ -1081,6 +1084,21 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	read_lbr();
+ #endif
+ 
++#if defined(__arm64__)
++	if (current_thread() == THREAD_NULL) {
++		/*
++		 * land (Redmi 3S): everything below needs per-CPU debugger
++		 * state, which does not exist this early in the boot, so an
++		 * early panic would die without ever naming itself.  Write it
++		 * to the early console first; that console is mirrored into
++		 * dip, so an unattended boot is still readable.
++		 */
++		extern void sweet_early_panic(const char *fmt, va_list *args);
++
++		sweet_early_panic(panic_format_str, panic_args);
++	}
++#endif
++
+ 	/* Turn off I/O tracing once we've panicked */
+ 	iotrace_disable();
+ 
