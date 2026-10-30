@@ -26,9 +26,9 @@ on:
           - all
         default: small
       size_mb:
-        description: "HFS+ volume size in MiB; land's userdata partition is 5374 MiB"
+        description: "HFS+ volume size in MiB; land userdata is 25100 MiB"
         type: string
-        default: "5300"
+        default: "7000"
 
 concurrency:
   group: root-image
@@ -112,7 +112,10 @@ jobs:
           # calls the root window, and 26301931008 bytes - the 5635047424 figure
           # in the reader is the APFS container that used to sit there.  The
           # default volume stays small because every MiB of it is a MiB to
-          # download and a MiB to write over USB.
+          # download and a MiB to write over USB, but it cannot be the size of
+          # the files either: the source volume measures 4.8 GiB with du(1) and
+          # HFS+ charges a 4 KiB block per file, which pushed the same content
+          # past a 5.2 GiB volume and made rsync die with ENOSPC on a mkdir.
           SIZE_MB=${{ inputs.size_mb }}
           # macOS 14 runners ship no newfs_hfs and hdiutil has no raw -type, so
           # build a UDIF with a case-sensitive HFS+ volume (iOS paths are
