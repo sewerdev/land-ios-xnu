@@ -41,7 +41,7 @@ extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
 extern void land_mark(const char *tag);
-extern void land_ram_console_arm(uint64_t va);
+extern void land_ram_console_arm(uint64_t va, const char *tag);
 
 #define LAND_CORE_PHYS  0x07824000UL
 #define LAND_CORE_SIZE  0x2F00
@@ -516,18 +516,28 @@ land_ram_header(void)
  * Called from arm_vm_init twice: once with the bootstrap alias (VA=PA region
  * start.s builds) and once when the kernel's own alias is live.  The boot
  * counter is read from the page left by the previous boot, so the host can
- * still tell which run a page came from after the pointer moves.
+ * still tell which run a page came from after the pointer moves.  The tag goes
+ * into the ring as the first thing the page ever hears, so a boot that dies
+ * right here still says which of the two addresses it died writing to.
  */
 void
-land_ram_console_arm(uint64_t va)
+land_ram_console_arm(uint64_t va, const char *tag)
 {
 	volatile uint64_t *h = (volatile uint64_t *)(uintptr_t)va;
+	const char *p;
 
 	land_ram = (volatile char *)(uintptr_t)va;
 	if (land_ram_boot == 0) {
 		land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
 	}
 	land_ram_header();
+	for (p = "ram console armed: "; *p != '\0'; p++) {
+		land_ram_tap(*p);
+	}
+	for (p = tag; *p != '\0'; p++) {
+		land_ram_tap(*p);
+	}
+	land_ram_tap('\n');
 	__asm__ volatile("dsb ishst" ::: "memory");
 }
 

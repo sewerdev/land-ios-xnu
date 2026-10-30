@@ -9,7 +9,7 @@ blocks, arm_vm_init puts the same block in the kernel table, and both arm
 pexpert/arm/land_sdhci.c with the page address it should mirror into.
 ---
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
-index 9a51f14..bed15c8 100644
+index 9a51f14..966238e 100644
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c
 @@ -1832,7 +1832,25 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
@@ -34,7 +34,7 @@ index 9a51f14..bed15c8 100644
 +static bool sweet_early_ram_mapped;
 +
 +/* pexpert/arm/land_sdhci.c owns the page layout */
-+extern void land_ram_console_arm(uint64_t va);
++extern void land_ram_console_arm(uint64_t va, const char *tag);
  
  static void
  sweet_early_map_final(void)
@@ -65,7 +65,7 @@ index 9a51f14..bed15c8 100644
 +	 * everything this function prints is captured even if the boot never gets to
 +	 * its own page tables - which is where the phone boot stops.
 +	 */
-+	land_ram_console_arm(SWEET_EARLY_RAM_BOOT_VA);
++	land_ram_console_arm(SWEET_EARLY_RAM_BOOT_VA, "the bootstrap alias");
 +#endif
 +
  	/*
@@ -77,7 +77,7 @@ index 9a51f14..bed15c8 100644
  	}
 +	if (sweet_early_ram_mapped) {
 +		/* TTBR0 goes away next: move the console page onto the kernel alias. */
-+		land_ram_console_arm(SWEET_EARLY_RAM_FINAL_VA);
++		land_ram_console_arm(SWEET_EARLY_RAM_FINAL_VA, "the kernel alias");
 +	}
  #elif defined(SWEET)
  	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
