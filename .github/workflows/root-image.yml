@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK"
-          hdiutil expand -format RAW "./$DMG_MEMBER" -o container.raw
+          hdiutil expand -format RAW ./volume.dmg -o container.raw
           ls -lh container.raw
           # macOS reads APFS natively, so no fuse helper is involved: try each
           # device the attach reports until one mounts read-only.
