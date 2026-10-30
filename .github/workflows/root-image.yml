@@ -25,6 +25,10 @@ on:
           - small
           - all
         default: small
+      size_mb:
+        description: "HFS+ volume size in MiB; land's userdata partition is 5374 MiB"
+        type: string
+        default: "5300"
 
 concurrency:
   group: root-image
@@ -104,37 +108,49 @@ jobs:
           cd "$WORK"
           SRC=$(cat src.dir)
           df -h . | tail -1
+          # The image has to be dd-able onto land's userdata partition, which is
+          # 5635047424 bytes, so the volume is sized for that and not for the
+          # 6 GiB the whole root would want.
+          SIZE_MB=${{ inputs.size_mb }}
           # macOS 14 runners ship no newfs_hfs and hdiutil has no raw -type, so
           # build a UDIF with a case-sensitive HFS+ volume (iOS paths are
           # case-sensitive and dyld expects it), fill it, then read the decoded
           # volume device back out: that dump is the dd-able image.
           rm -f root.dmg root.hfs
           hdiutil create -layout NONE -fs "Case-sensitive HFS+" -volname iOS \
-            -size 6g -o root.dmg
+            -size ${SIZE_MB}m -o root.dmg
           hdiutil attach root.dmg > attach.txt
           cat attach.txt
           DIR=/Volumes/iOS
           test -d "$DIR" || { echo "volume did not automount"; exit 1; }
-          if [ "${{ inputs.subset }}" = all ]; then
-            rsync -a "$SRC"/ "$DIR"/
-          else
-            # Things the first boot does not need: downloaded asset catalogs,
-            # fonts cache, wallpapers, per-device firmware bundles.
-            rsync -a \
-              --exclude 'System/Library/AssetsV2/' \
-              --exclude 'System/Library/Assistants/' \
-              --exclude 'System/Library/Keyboard Layouts/' \
-              --exclude 'System/Library/Wallpaper/' \
-              --exclude 'System/Library/Fonts/' \
-              --exclude 'System/Library/Accessibility/' \
-              --exclude 'System/Library/Components/' \
-              --exclude 'System/Library/LocationBundles/' \
-              --exclude 'System/Library/PrivateFrameworks/AssistantServices/' \
-              "$SRC"/ "$DIR"/
+          # Things the first boot does not need: downloaded asset catalogs,
+          # fonts cache, wallpapers, per-device firmware bundles.  rsync gives
+          # up with errno 34 (Result too large) on a compiled .car and with
+          # EACCES on the DMG's .file, neither of which may stop the build -
+          # exit 24 just means some files were skipped.
+          EXCLUDES=()
+          if [ "${{ inputs.subset }}" != all ]; then
+            EXCLUDES=(
+              --exclude 'System/Library/AssetsV2/'
+              --exclude 'System/Library/Assistants/'
+              --exclude 'System/Library/Keyboard Layouts/'
+              --exclude 'System/Library/Wallpaper/'
+              --exclude 'System/Library/Fonts/'
+              --exclude 'System/Library/Accessibility/'
+              --exclude 'System/Library/Components/'
+              --exclude 'System/Library/LocationBundles/'
+              --exclude 'System/Library/PrivateFrameworks/AssistantServices/'
+              --exclude '*.car'
+            )
           fi
+          # shellcheck disable=SC2068
+          rsync -a --ignore-errors ${EXCLUDES[@]+"${EXCLUDES[@]}"} "$SRC"/ "$DIR"/ && rc=0 || rc=$?
+          if [ "$rc" -gt 24 ]; then echo "rsync failed with $rc"; exit 1; fi
+          echo "rsync returned $rc (0 = clean, 24 = some files skipped)"
           mkdir -p "$DIR/dev" "$DIR/proc" "$DIR/tmp"
           sync
           df -h "$DIR" | tail -1
+          df -k "$DIR" | tail -1 | awk '{print "volume avail KiB:", $4}'
           hdiutil detach /Volumes/iOS
           # read the decoded volume back out: with -layout NONE the whole image
           # is the file system, so the device dump is exactly what the kernel
@@ -145,6 +161,11 @@ jobs:
           dd if="$VD" of=root.hfs bs=8m
           hdiutil detach "$VD" -force || true
           ls -lh root.hfs
+          # land userdata is 5635047424 bytes; an image that does not fit is
+          # worse than useless, it is a partially flashed partition
+          SZ=$(wc -c < root.hfs | tr -d ' ')
+          echo "root.hfs $SZ bytes"
+          [ "$SZ" -le 5635047424 ] || { echo "image bigger than the userdata partition"; exit 1; }
           # verify the raw file by mounting it as a plain disk image
           hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage root.hfs > verify.txt
           cat verify.txt
