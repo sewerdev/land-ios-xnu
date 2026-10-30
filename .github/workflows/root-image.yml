@@ -104,18 +104,17 @@ jobs:
           cd "$WORK"
           SRC=$(cat src.dir)
           df -h . | tail -1
-          # macOS 14 runners ship no newfs_hfs, so let hdiutil format it: a
-          # single-size device image is a raw file, and -layout NONE keeps a
-          # partition map out of it, so the result is dd-able as it stands.
-          # Case-sensitive, because iOS paths are and dyld expects it.
-          rm -f root.hfs
-          hdiutil create -type SDIF -layout NONE -fs "Case-sensitive HFS+" \
-            -volname iOS -size 6g -o root.hfs
-          ls -lh root.hfs
-          hdiutil imageinfo root.hfs | grep -iE "Class Code|Format|Partition" | head -6
-          DEV=$(hdiutil attach -nomount root.hfs | awk '{print $NF}')
-          DIR=$(mktemp -d)
-          mount -t hfs "$DEV" "$DIR"
+          # macOS 14 runners ship no newfs_hfs and hdiutil has no raw -type, so
+          # build a UDIF with a case-sensitive HFS+ volume (iOS paths are
+          # case-sensitive and dyld expects it), fill it, then read the decoded
+          # volume device back out: that dump is the dd-able image.
+          rm -f root.dmg root.hfs
+          hdiutil create -layout NONE -fs "Case-sensitive HFS+" -volname iOS \
+            -size 6g -o root.dmg
+          hdiutil attach root.dmg > attach.txt
+          cat attach.txt
+          DIR=/Volumes/iOS
+          test -d "$DIR" || { echo "volume did not automount"; exit 1; }
           if [ "${{ inputs.subset }}" = all ]; then
             rsync -a "$SRC"/ "$DIR"/
           else
@@ -136,19 +135,24 @@ jobs:
           mkdir -p "$DIR/dev" "$DIR/proc" "$DIR/tmp"
           sync
           df -h "$DIR" | tail -1
-          umount "$DIR"
-          hdiutil detach "$DEV"
+          hdiutil detach /Volumes/iOS
+          # read the decoded volume back out: with -layout NONE the whole image
+          # is the file system, so the device dump is exactly what the kernel
+          # will find at the partition it is told to mount
+          hdiutil attach -readonly -nomount root.dmg > devs.txt
+          cat devs.txt
+          VD=$(grep -oE '/dev/disk[0-9]+(s[0-9]+)?' devs.txt | tail -1)
+          dd if="$VD" of=root.hfs bs=8m
+          hdiutil detach "$VD" -force || true
           ls -lh root.hfs
-          # prove the volume is readable as its own artifact: re-attach read-only
-          VDEV=$(hdiutil attach -readonly -nomount root.hfs | awk '{print $NF}')
-          DIR2=$(mktemp -d)
-          mount -t hfs -o ro "$VDEV" "$DIR2"
-          ls "$DIR2"
-          test -f "$DIR2/sbin/launchd" || { echo "launchd missing from the image"; exit 1; }
-          test -f "$DIR2/usr/lib/dyld" || { echo "dyld missing from the image"; exit 1; }
-          du -sh "$DIR2"
-          umount "$DIR2"
-          hdiutil detach "$VDEV"
+          # verify the raw file by mounting it as a plain disk image
+          hdiutil attach -readonly -imagekey diskimage-class=CRawDiskImage root.hfs > verify.txt
+          cat verify.txt
+          test -f /Volumes/iOS/sbin/launchd || { echo "launchd missing from the image"; exit 1; }
+          test -f /Volumes/iOS/usr/lib/dyld || { echo "dyld missing from the image"; exit 1; }
+          ls /Volumes/iOS
+          du -sh /Volumes/iOS
+          hdiutil detach /Volumes/iOS
 
       - name: Split for download
         run: |
