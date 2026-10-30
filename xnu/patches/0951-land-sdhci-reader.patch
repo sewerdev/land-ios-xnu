@@ -1,15 +1,35 @@
 land: eMMC PIO reader, its registration and one boot-time probe
 
-Reads and writes 512-byte blocks with the programmed-I/O recipe measured on the phone,
-registers itself in pexpert/conf/files.arm64, and runs land_emmc_probe() from
-pe_identify_machine() before that function returns early on soc_base.
+Reads and writes 512-byte blocks with the programmed-I/O recipe measured on the phone
+and registers itself in pexpert/conf/files.arm64.  land_emmc_probe() runs from the top of
+bsd_init(), the first point where threads, scheduler locks and io_map exist.
 ---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..2b0c74c 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -476,6 +476,15 @@ bsd_rooted_ramdisk(void)
+ void
+ bsd_init(void)
+ {
++	{
++		extern void land_emmc_probe(void);
++
++		/* land: the first point where threads, scheduler locks and io_map all
++		 * exist.  Doing eMMC work earlier takes an abort in the pre-thread
++		 * per-CPU paths, and the boot dies before it can report anything.
++		 */
++		land_emmc_probe();
++	}
+ 	struct uthread *ut;
+ 	vnode_t init_rootvnode = NULLVP;
+ 	struct proc_ro_data kernproc_ro_data = {
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..c6580b7
+index 0000000..693f90d
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,652 @@
 +/*
 + * land_sdhci.c - eMMC access for the Redmi 3S (land, MSM8937) from XNU.
 + *
@@ -52,7 +72,6 @@ index 0000000..c6580b7
 +extern uint64_t land_emmc_root_bytes(void);
 +extern unsigned int land_emmc_faults(void);
 +extern void land_console_tap(char c);
-+extern void land_arm(void);
 +extern void land_mark(const char *tag);
 +
 +#define LAND_CORE_PHYS  0x07824000UL
@@ -610,19 +629,8 @@ index 0000000..c6580b7
 +}
 +
 +/*
-+ * Arm the mirror and the marks.  Called from pexpert/arm/pe_serial.c once the
-+ * framebuffer console has been mapped: that call to ml_io_map is the proof that
-+ * the I/O VA cursor is usable, and everything of ours stays off before it.
-+ */
-+void
-+land_arm(void)
-+{
-+        land_armed = 1;
-+}
-+
-+/*
-+ * Run once from pe_identify_machine().  Everything it says goes through the
-+ * console mirror above, so it is enough to talk and then flush.
++ * Run once from bsd_init().  Everything it says goes through the console mirror
++ * above, so it is enough to talk and then flush.
 + */
 +void
 +land_emmc_probe(void)
@@ -640,12 +648,10 @@ index 0000000..c6580b7
 +        }
 +
 +        /*
-+         * io_map() bumps a VA cursor that is not set up yet while arm_vm_init
-+         * is still running: mapping that early takes the abort in pmap_map_bd()
-+         * rather than producing a mapping, which is exactly how a mark meant to
-+         * report progress became the fault it was reporting.  pe_identify_machine
-+         * is the first point proven safe on both ADTs, so the mirror and the
-+         * marks stay off until here.
++         * Before bsd_init() there is no current thread, and both io_map() and
++         * kprintf() reach per-CPU state that only exists after the scheduler is
++         * up: mapping or printing there takes an abort inside the fault path.  The
++         * mirror and the marks stay off until this point for exactly that reason.
 +         */
 +        land_armed = 1;
 +        if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {
@@ -676,26 +682,6 @@ index 0000000..c6580b7
 +        }
 +        land_log_flush();
 +}
-diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
-index aa75c0a..70038b5 100644
---- a/pexpert/arm/pe_identify_machine.c
-+++ b/pexpert/arm/pe_identify_machine.c
-@@ -57,6 +57,15 @@ pe_identify_machine(boot_args * bootArgs)
- 
- 	(void)bootArgs;
- 
-+	{
-+		extern void land_emmc_probe(void);
-+
-+		/* land: read block 0 of the root window and journal into dip before
-+		 * anything can stop the boot without a trace.
-+		 */
-+		land_emmc_probe();
-+	}
-+
- 	if (pe_arm_get_soc_base_phys() == 0) {
- 		return;
- 	}
 diff --git a/pexpert/conf/files.arm64 b/pexpert/conf/files.arm64
 index 20b9ae7..8055bee 100644
 --- a/pexpert/conf/files.arm64

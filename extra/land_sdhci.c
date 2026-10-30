@@ -40,7 +40,6 @@ extern uint64_t land_emmc_root_lba(void);
 extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
-extern void land_arm(void);
 extern void land_mark(const char *tag);
 
 #define LAND_CORE_PHYS  0x07824000UL
@@ -598,19 +597,8 @@ land_mark(const char *tag)
 }
 
 /*
- * Arm the mirror and the marks.  Called from pexpert/arm/pe_serial.c once the
- * framebuffer console has been mapped: that call to ml_io_map is the proof that
- * the I/O VA cursor is usable, and everything of ours stays off before it.
- */
-void
-land_arm(void)
-{
-        land_armed = 1;
-}
-
-/*
- * Run once from pe_identify_machine().  Everything it says goes through the
- * console mirror above, so it is enough to talk and then flush.
+ * Run once from bsd_init().  Everything it says goes through the console mirror
+ * above, so it is enough to talk and then flush.
  */
 void
 land_emmc_probe(void)
@@ -628,12 +616,10 @@ land_emmc_probe(void)
         }
 
         /*
-         * io_map() bumps a VA cursor that is not set up yet while arm_vm_init
-         * is still running: mapping that early takes the abort in pmap_map_bd()
-         * rather than producing a mapping, which is exactly how a mark meant to
-         * report progress became the fault it was reporting.  pe_identify_machine
-         * is the first point proven safe on both ADTs, so the mirror and the
-         * marks stay off until here.
+         * Before bsd_init() there is no current thread, and both io_map() and
+         * kprintf() reach per-CPU state that only exists after the scheduler is
+         * up: mapping or printing there takes an abort inside the fault path.  The
+         * mirror and the marks stay off until this point for exactly that reason.
          */
         land_armed = 1;
         if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {

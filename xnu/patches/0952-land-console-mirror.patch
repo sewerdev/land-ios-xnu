@@ -1,36 +1,26 @@
 land: mirror every console character into dip
 
-uart_putc_options_() is where all output of this port funnels, so a tap there captures
-the console including panics.  The mirror writes a 4 KiB ring into blocks 64..71 of dip,
-and land_arm() from the framebuffer-console mapping keeps it off until ml_io_map is known
-to work - used earlier it was the abort it was supposed to report.
+uart_putc_options_() is where kprintf, IOLog and BSD printf all arrive on this port, so a
+tap there captures the console including panic output.  The mirror writes a 4 KiB ring into
+blocks 64..71 of dip and stays off until the probe arms it.
 ---
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 19f27cd..1048000 100644
+index 19f27cd..c239e5b 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -27,6 +27,12 @@
+@@ -27,6 +27,11 @@
  #include <pexpert/arm64/board_config.h>
  #include <arm64/proc_reg.h>
  #include <arm64/sweet_early.h>
 +
-+/* land: pexpert/arm/land_sdhci.c mirrors console output into dip (blocks 64..71)
-+ * and journals stage marks; both stay off until land_arm() says MMIO is mappable */
++/* land: pexpert/arm/land_sdhci.c mirrors console output into dip (blocks 64..71);
++ * the mirror stays off until the probe arms it, because io_map needs threads */
 +extern void land_console_tap(char c);
-+extern void land_arm(void);
 +
  #include <pexpert/arm/protos.h>
  #include <kern/sched_prim.h>
  #if HIBERNATION
-@@ -839,6 +845,7 @@ fbcon_probe(void)
- 	sweet_early_mark(18, "fbcon mapping returned");
- 	if (fbcon_base != NULL) {
- 		register_serial_functions(&sweet_fbcon_serial_functions);
-+		land_arm();	/* the I/O VA cursor demonstrably works now */
- 	}
- }
- 
-@@ -1153,6 +1160,8 @@ uart_putc_options_(char c, bool poll, bool force)
+@@ -1153,6 +1158,8 @@ uart_putc_options_(char c, bool poll, bool force)
  {
  	struct pe_serial_functions *fns = gPESF;
  
