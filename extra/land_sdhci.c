@@ -41,6 +41,7 @@ extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
 extern void land_mark(const char *tag);
+extern void land_ram_console_arm(uint64_t va);
 
 #define LAND_CORE_PHYS  0x07824000UL
 #define LAND_CORE_SIZE  0x2F00
@@ -469,6 +470,82 @@ land_put_hex(char *p, const char *label, uint64_t v, int bits)
         return p;
 }
 
+/* ---------------------------------------------------------------- RAM console
+ *
+ * dip needs a working eMMC controller, and on the phone the boot stops well
+ * before it can journal anything, so the console also goes into DRAM that
+ * outlives the reset.  Android's device tree carries ramoops@b0000000 with
+ * reg=<0xb0000000 0x800000> and its last 4 KiB (0xb07f0000) is unused; LK does
+ * not clear a warm-reset region and DRAM survives the watchdog bark - measured
+ * with the shim, which found its own magic there after a reset.  arm_vm_init
+ * aliases that page into the same L2 table as the early framebuffer console,
+ * so this needs no io_map, no lock and no thread, and the shim reads the page
+ * at the start of the next boot into dip blocks 32..39.
+ *
+ * Written Non-Cacheable on purpose: a dirty cache line is invalidated at reset
+ * and would take the message with it.
+ */
+
+#define LAND_RAM_MAGIC  0x314D4152444E414CULL   /* "LANDRAM1" */
+#define LAND_RAM_BYTES  4096u
+#define LAND_RAM_HDR    64u
+#define LAND_RAM_RING   (LAND_RAM_BYTES - LAND_RAM_HDR)
+
+static volatile char *land_ram;                 /* NULL until the alias exists */
+static unsigned int land_ram_used;              /* write cursor, mod ring size */
+static uint64_t land_ram_total;
+static uint64_t land_ram_boot;
+static unsigned int land_ram_lines;
+
+static void
+land_ram_header(void)
+{
+	volatile uint64_t *h = (volatile uint64_t *)land_ram;
+
+	h[0] = LAND_RAM_MAGIC;
+	h[1] = land_ram_boot;
+	h[2] = land_ram_total;
+	h[3] = land_ram_used;
+	h[4] = land_ram_lines;
+	h[5] = land_faults;
+	h[6] = (uint64_t)land_card_ready;
+	h[7] = (uint64_t)land_rca;
+}
+
+/*
+ * Called from arm_vm_init twice: once with the bootstrap alias (VA=PA region
+ * start.s builds) and once when the kernel's own alias is live.  The boot
+ * counter is read from the page left by the previous boot, so the host can
+ * still tell which run a page came from after the pointer moves.
+ */
+void
+land_ram_console_arm(uint64_t va)
+{
+	volatile uint64_t *h = (volatile uint64_t *)(uintptr_t)va;
+
+	land_ram = (volatile char *)(uintptr_t)va;
+	if (land_ram_boot == 0) {
+		land_ram_boot = (h[0] == LAND_RAM_MAGIC) ? h[1] + 1 : 1;
+	}
+	land_ram_header();
+	__asm__ volatile("dsb ishst" ::: "memory");
+}
+
+static void
+land_ram_tap(char c)
+{
+	if (land_ram == NULL) {
+		return;
+	}
+	land_ram[LAND_RAM_HDR + land_ram_used] = c;
+	land_ram_used = (land_ram_used + 1) % LAND_RAM_RING;
+	land_ram_total++;
+	if (c == '\n') {
+		land_ram_lines++;
+		land_ram_header();
+	}
+}
+
 /* ------------------------------------------------------------------ console
  *
  * Nobody films the phone screen for us, so everything that reaches the console
@@ -535,13 +612,10 @@ land_log_flush(void)
         land_log_busy = 0;
 }
 
-void
-land_console_tap(char c)
+static void
+land_dip_tap(char c)
 {
-        if (!land_armed) {
-                return;
-        }
-        if (land_log_busy) {
+        if (!land_armed || land_log_busy) {
                 return;
         }
         if (land_log_silent > 0) {
@@ -561,6 +635,24 @@ land_console_tap(char c)
         if (c == '\n' && land_log_since >= 64) {
                 land_log_flush();
         }
+}
+
+static int land_tapping;
+
+void
+land_console_tap(char c)
+{
+        if (land_tapping) {
+                /* The framebuffer console registers itself as a serial function, so a
+                 * character that came in through uart_putc_options_() reaches this tap
+                 * a second time on its way to sweet_early_putc().  Record it once.
+                 */
+                return;
+        }
+        land_tapping = 1;
+        land_ram_tap(c);
+        land_dip_tap(c);
+        land_tapping = 0;
 }
 
 /*
