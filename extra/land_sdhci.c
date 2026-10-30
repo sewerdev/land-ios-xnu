@@ -115,8 +115,11 @@ static vm_offset_t land_gcc;
 static uint32_t land_rca;
 static int land_card_ready;
 static unsigned int land_faults;
-static uint64_t land_root_lba = 9700368ULL;
-static uint64_t land_root_bytes = 5635047424ULL;
+static uint64_t land_root_lba = 9700368ULL;      /* userdata = mmcblk0p49, TWRP */
+/* Measured partition size (51370959 blocks), not the 5635047424 of the APFS
+ * container that used to sit here: root.hfs is 9437184000 bytes, and a block
+ * device the third of its own image mounts as a truncated volume. */
+static uint64_t land_root_bytes = 26301931008ULL;
 
 static inline uint32_t
 io_rd32(vm_offset_t base, uint32_t off)
