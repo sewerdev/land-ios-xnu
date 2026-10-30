@@ -1,0 +1,99 @@
+land: read the MDSS window from the display node
+
+AppleCLCD::start is where the phone boot ends now: it maps four topaz
+MDSS registers (vig 0x05e05000, ctl 0x05e02000, intf1 0x05e6b000, dsi
+0x05e94000) and the first read of a returned handle takes a level-0
+translation fault.  land's MDSS is at 0x01a00000 - what the shim
+programs the panel from - with the same offsets inside the window, so
+take the base from the display node and keep the offsets.  A board that
+names no base gets no direct scanout, which is where land is until the
+panel work; sweetmdp=0 turns the window off for a boot that must not
+touch MMIO.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1d3ee17..6eea3b1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -107,6 +107,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/c++/OSData.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+@@ -304,6 +305,47 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The MDSS register window is board-specific.  0092/0098/0104 baked in the base of
++ * the board this port was written on (mdp at 0x05e00000, sm6115), and land is an
++ * older SoC whose MDSS lives at 0x01a00000 - the address the shim programs the
++ * panel from, with the same offsets inside the window.  Reading topaz's window is
++ * not a harmless no-op: the phone took a level-0 translation fault on the first
++ * word of the returned handle.  So ask the display node for the base and treat a
++ * board that names none as having no direct scanout; sweetmdp=0 says the same
++ * thing at boot time for a run that must not touch MMIO at all.
++ */
++static uint64_t
++sweet_mdp_base(IOService *provider)
++{
++	uint64_t base = 0;
++	uint32_t off = 1;
++	OSData *d;
++
++	(void)PE_parse_boot_argn("sweetmdp", &off, sizeof(off));
++	if (off == 0) {
++		IOLog("SWEET FB: MDSS access off (sweetmdp=0)\n");
++		return 0;
++	}
++	if (provider != NULL) {
++		d = OSDynamicCast(OSData, provider->getProperty("mdp-base"));
++		if (d != NULL) {
++			if (d->getLength() == sizeof(uint64_t)) {
++				base = *(const uint64_t *)d->getBytes();
++			} else if (d->getLength() == sizeof(uint32_t)) {
++				base = *(const uint32_t *)d->getBytes();
++			}
++		}
++	}
++	if (base == 0) {
++		IOLog("SWEET FB: no mdp-base, no direct scanout\n");
++		return 0;
++	}
++	IOLog("SWEET FB: MDSS at %#llx (vig %#llx ctl %#llx intf1 %#llx dsi %#llx)\n", base,
++	    base + 0x5000, base + 0x2000, base + 0x6b000, base + 0x94000);
++	return base;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -352,11 +394,12 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	uint64_t mdp = sweet_mdp_base(provider);
++	fVig0 = mdp != 0 ? (volatile uint32_t *)ml_io_map((vm_offset_t)(mdp + 0x5000), 0x1000) : NULL;
++	fCtl0 = mdp != 0 ? (volatile uint32_t *)ml_io_map((vm_offset_t)(mdp + 0x2000), 0x1000) : NULL;
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+-	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
++	fDsi = mdp != 0 ? (volatile uint8_t *)ml_io_map((vm_offset_t)(mdp + 0x94000), 0x1000) : NULL;
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -398,8 +441,8 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(accel);
+-	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+-	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
++	/* the same window, sized by the board: intf_1 at mdp+0x6b000 */
++	fIntf1 = mdp != 0 ? (volatile uint32_t *)ml_io_map((vm_offset_t)(mdp + 0x6b000), 0x1000) : NULL;
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
