@@ -35,10 +35,10 @@ index 42362c5..657a7b4 100644
  	uint32_t        memsize;
  	uint64_t        xmaxmem;
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index 60ce933..bffa8c5 100644
+index ace7183..77e3b25 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -451,6 +451,27 @@ start_cpu:
+@@ -451,6 +451,31 @@ start_cpu:
  	b.ne	1b
  .endmacro
  
@@ -51,10 +51,14 @@ index 60ce933..bffa8c5 100644
 + * and the page address goes in x1, which is why every call site sits where a
 + * register dump says they are dead; x19..x26 are live across this code.
 + *
++ * MOV64 because the integrated assembler will not expand a plain "mov x1,
++ * #0x867fe000": that is neither a single movz nor a logical immediate, and the
++ * build dies on the macro instantiation.
++ */
 + * Layout of the page: +0 magic, +8 boot count, +16 last stage, +24 OR of 1<<stage.
 + */
 +.macro land_brd n, addr
-+	mov	x1, \addr
++	MOV64	x1, \addr
 +	mov	w2, #\n
 +	str	w2, [x1, #16]
 +	ldr	x3, [x1, #24]
@@ -66,7 +70,7 @@ index 60ce933..bffa8c5 100644
  /*
   *  arg0 - virtual start address
   *  arg1 - physical start address
-@@ -512,6 +533,18 @@ LEXT(start_first_cpu)
+@@ -512,6 +537,18 @@ LEXT(start_first_cpu)
  
  	mov		x20, x0
  	mov		x21, #0
@@ -85,7 +89,7 @@ index 60ce933..bffa8c5 100644
  
  #if defined(SWEET)
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-@@ -735,6 +768,11 @@ Ltopaz_fb_block:
+@@ -735,6 +772,11 @@ Ltopaz_fb_block:
  	dsb		ish
  
  
@@ -97,7 +101,7 @@ index 60ce933..bffa8c5 100644
  	b		common_start
  
  /*
-@@ -872,6 +910,12 @@ common_start:
+@@ -872,6 +914,12 @@ common_start:
  	MOV64   x0, SCTLR_EL1_DEFAULT
  	MSR_SCTLR_EL1_X0
  	isb		sy
@@ -110,7 +114,7 @@ index 60ce933..bffa8c5 100644
  
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
-@@ -904,8 +948,22 @@ common_start:
+@@ -904,8 +952,22 @@ common_start:
  
  	// Read MIDR before start of per-SoC tunables
  	mrs x12, MIDR_EL1
@@ -133,7 +137,7 @@ index 60ce933..bffa8c5 100644
  
  
  #if HAS_CLUSTER
-@@ -915,6 +973,12 @@ common_start:
+@@ -915,6 +977,12 @@ common_start:
  	msr		CPU_OVRD, x9
  #endif
  
