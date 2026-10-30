@@ -1,11 +1,15 @@
 land: eMMC PIO reader, its registration and one boot-time probe
 
+Reads and writes 512-byte blocks with the programmed-I/O recipe measured on the phone,
+registers itself in pexpert/conf/files.arm64, and runs land_emmc_probe() from
+pe_identify_machine() before that function returns early on soc_base.
+---
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..ff15c58
+index 0000000..c6580b7
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,666 @@
 +/*
 + * land_sdhci.c - eMMC access for the Redmi 3S (land, MSM8937) from XNU.
 + *
@@ -48,6 +52,7 @@ index 0000000..ff15c58
 +extern uint64_t land_emmc_root_bytes(void);
 +extern unsigned int land_emmc_faults(void);
 +extern void land_console_tap(char c);
++extern void land_arm(void);
 +extern void land_mark(const char *tag);
 +
 +#define LAND_CORE_PHYS  0x07824000UL
@@ -498,6 +503,7 @@ index 0000000..ff15c58
 +static unsigned int land_log_seq;
 +static int land_log_silent;                       /* skip this many chars */
 +static int land_log_busy;
++static int land_armed;                    /* set by land_emmc_probe: MMIO may be mapped */
 +
 +static void
 +land_log_flush(void)
@@ -545,6 +551,9 @@ index 0000000..ff15c58
 +void
 +land_console_tap(char c)
 +{
++        if (!land_armed) {
++                return;
++        }
 +        if (land_log_busy) {
 +                return;
 +        }
@@ -580,7 +589,7 @@ index 0000000..ff15c58
 +        uint8_t blk[512];
 +        char *p;
 +
-+        if (land_log_busy || !land_ready()) {
++        if (!land_armed || land_log_busy || !land_ready()) {
 +                return;
 +        }
 +        land_log_busy = 1;
@@ -601,6 +610,17 @@ index 0000000..ff15c58
 +}
 +
 +/*
++ * Arm the mirror and the marks.  Called from pexpert/arm/pe_serial.c once the
++ * framebuffer console has been mapped: that call to ml_io_map is the proof that
++ * the I/O VA cursor is usable, and everything of ours stays off before it.
++ */
++void
++land_arm(void)
++{
++        land_armed = 1;
++}
++
++/*
 + * Run once from pe_identify_machine().  Everything it says goes through the
 + * console mirror above, so it is enough to talk and then flush.
 + */
@@ -618,6 +638,16 @@ index 0000000..ff15c58
 +        if (!enable) {
 +                return;
 +        }
++
++        /*
++         * io_map() bumps a VA cursor that is not set up yet while arm_vm_init
++         * is still running: mapping that early takes the abort in pmap_map_bd()
++         * rather than producing a mapping, which is exactly how a mark meant to
++         * report progress became the fault it was reporting.  pe_identify_machine
++         * is the first point proven safe on both ADTs, so the mirror and the
++         * marks stay off until here.
++         */
++        land_armed = 1;
 +        if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {
 +                if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
 +                    prop_size == sizeof(uint32_t)) {
@@ -647,7 +677,7 @@ index 0000000..ff15c58
 +        land_log_flush();
 +}
 diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
-index aa75c0a..a079a09 100644
+index aa75c0a..70038b5 100644
 --- a/pexpert/arm/pe_identify_machine.c
 +++ b/pexpert/arm/pe_identify_machine.c
 @@ -57,6 +57,15 @@ pe_identify_machine(boot_args * bootArgs)
@@ -657,8 +687,8 @@ index aa75c0a..a079a09 100644
 +	{
 +		extern void land_emmc_probe(void);
 +
-+		/* land: read block 0 of the root partition and journal the result
-+		 * into dip, before anything can stop the boot silently.
++		/* land: read block 0 of the root window and journal into dip before
++		 * anything can stop the boot without a trace.
 +		 */
 +		land_emmc_probe();
 +	}

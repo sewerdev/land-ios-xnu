@@ -40,6 +40,7 @@ extern uint64_t land_emmc_root_lba(void);
 extern uint64_t land_emmc_root_bytes(void);
 extern unsigned int land_emmc_faults(void);
 extern void land_console_tap(char c);
+extern void land_arm(void);
 extern void land_mark(const char *tag);
 
 #define LAND_CORE_PHYS  0x07824000UL
@@ -490,6 +491,7 @@ static uint64_t land_log_total;
 static unsigned int land_log_seq;
 static int land_log_silent;                       /* skip this many chars */
 static int land_log_busy;
+static int land_armed;                    /* set by land_emmc_probe: MMIO may be mapped */
 
 static void
 land_log_flush(void)
@@ -537,6 +539,9 @@ land_log_flush(void)
 void
 land_console_tap(char c)
 {
+        if (!land_armed) {
+                return;
+        }
         if (land_log_busy) {
                 return;
         }
@@ -572,7 +577,7 @@ land_mark(const char *tag)
         uint8_t blk[512];
         char *p;
 
-        if (land_log_busy || !land_ready()) {
+        if (!land_armed || land_log_busy || !land_ready()) {
                 return;
         }
         land_log_busy = 1;
@@ -593,6 +598,17 @@ land_mark(const char *tag)
 }
 
 /*
+ * Arm the mirror and the marks.  Called from pexpert/arm/pe_serial.c once the
+ * framebuffer console has been mapped: that call to ml_io_map is the proof that
+ * the I/O VA cursor is usable, and everything of ours stays off before it.
+ */
+void
+land_arm(void)
+{
+        land_armed = 1;
+}
+
+/*
  * Run once from pe_identify_machine().  Everything it says goes through the
  * console mirror above, so it is enough to talk and then flush.
  */
@@ -610,6 +626,16 @@ land_emmc_probe(void)
         if (!enable) {
                 return;
         }
+
+        /*
+         * io_map() bumps a VA cursor that is not set up yet while arm_vm_init
+         * is still running: mapping that early takes the abort in pmap_map_bd()
+         * rather than producing a mapping, which is exactly how a mark meant to
+         * report progress became the fault it was reporting.  pe_identify_machine
+         * is the first point proven safe on both ADTs, so the mirror and the
+         * marks stay off until here.
+         */
+        land_armed = 1;
         if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {
                 if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
                     prop_size == sizeof(uint32_t)) {
