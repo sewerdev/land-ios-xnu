@@ -104,10 +104,16 @@ jobs:
           cd "$WORK"
           SRC=$(cat src.dir)
           df -h . | tail -1
-          dd if=/dev/zero of=root.hfs bs=1m count=8192
-          # case-sensitive: iOS paths are case-sensitive and dyld expects it
-          /usr/sbin/newfs_hfs -v iOS -C utf-8 root.hfs
-          DEV=$(hdiutil attach -nomount root.hfs)
+          # macOS 14 runners ship no newfs_hfs, so let hdiutil format it: a
+          # single-size device image is a raw file, and -layout NONE keeps a
+          # partition map out of it, so the result is dd-able as it stands.
+          # Case-sensitive, because iOS paths are and dyld expects it.
+          rm -f root.hfs
+          hdiutil create -type SDIF -layout NONE -fs "Case-sensitive HFS+" \
+            -volname iOS -size 6g -o root.hfs
+          ls -lh root.hfs
+          hdiutil imageinfo root.hfs | grep -iE "Class Code|Format|Partition" | head -6
+          DEV=$(hdiutil attach -nomount root.hfs | awk '{print $NF}')
           DIR=$(mktemp -d)
           mount -t hfs "$DEV" "$DIR"
           if [ "${{ inputs.subset }}" = all ]; then
