@@ -1,0 +1,55 @@
+land: print the cpu map when the MPIDR lookup fails
+
+ml_get_cpu_number() returning -1 is what ends the phone boot, and the assert
+that follows names no number.  Print the masked MPIDR we searched for, how
+many CPUs the tree described and the phys_id of each, once, through kprintf -
+which the retained-DRAM console mirror turns into a readable record.
+---
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 4fdefca..49d0c8f 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1204,6 +1204,12 @@ ml_get_boot_cluster_type(void)
+ 	return topology_info.boot_cluster->cluster_type;
+ }
+ 
++/*
++ * Set once by the diagnostic in ml_get_cpu_number(): the failing lookup is
++ * on a path that runs repeatedly, and the map does not change.
++ */
++static int land_cpumap_reported;
++
+ int
+ ml_get_cpu_number(uint32_t phys_id)
+ {
+@@ -1215,6 +1221,30 @@ ml_get_cpu_number(uint32_t phys_id)
+ 		}
+ 	}
+ 
++	/*
++	 * land (Redmi 3S): the callers assert on the -1, which says only that a
++	 * number is wrong, and two sides can be wrong here - the MPIDR the
++	 * bootloader left us on, or the cpu tree the kernel was handed.  Say what
++	 * the map actually contains, once.  kprintf reaches the early console, and
++	 * the early console is mirrored into retained DRAM
++	 * (pexpert/arm/land_sdhci.c), so a phone boot nobody is watching stays
++	 * readable.
++	 */
++	if (land_cpumap_reported == 0) {
++		uint64_t mpidr = 0;
++		unsigned i;
++
++		land_cpumap_reported = 1;
++		MRS(mpidr, "MPIDR_EL1");
++		kprintf("land cpumap: want %x mpidr %llx num_cpus %d max_cpu_id %d\n",
++		    phys_id, (unsigned long long)mpidr, (int)topology_info.num_cpus,
++		    topology_info.max_cpu_id);
++		for (i = 0; i < topology_info.num_cpus && i < 8; i++) {
++			kprintf("land cpumap: cpu[%u] phys_id %x\n", i,
++			    topology_info.cpus[i].phys_id);
++		}
++	}
++
+ 	return -1;
+ }
+ 
