@@ -512,6 +512,21 @@ land_ram_header(void)
 	h[7] = (uint64_t)land_rca;
 }
 
+static void
+land_ram_tap(char c)
+{
+	if (land_ram == NULL) {
+		return;
+	}
+	land_ram[LAND_RAM_HDR + land_ram_used] = c;
+	land_ram_used = (land_ram_used + 1) % LAND_RAM_RING;
+	land_ram_total++;
+	if (c == '\n') {
+		land_ram_lines++;
+		land_ram_header();
+	}
+}
+
 /*
  * Called from arm_vm_init twice: once with the bootstrap alias (VA=PA region
  * start.s builds) and once when the kernel's own alias is live.  The boot
@@ -549,21 +564,6 @@ land_ram_console_arm(uint64_t va, const char *tag)
 		land_ram = NULL;
 	}
 	__asm__ volatile("dsb ishst" ::: "memory");
-}
-
-static void
-land_ram_tap(char c)
-{
-	if (land_ram == NULL) {
-		return;
-	}
-	land_ram[LAND_RAM_HDR + land_ram_used] = c;
-	land_ram_used = (land_ram_used + 1) % LAND_RAM_RING;
-	land_ram_total++;
-	if (c == '\n') {
-		land_ram_lines++;
-		land_ram_header();
-	}
 }
 
 /* ------------------------------------------------------------------ console

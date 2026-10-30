@@ -26,7 +26,7 @@ index bb2a2bf..2b0c74c 100644
  	struct proc_ro_data kernproc_ro_data = {
 diff --git a/pexpert/arm/land_sdhci.c b/pexpert/arm/land_sdhci.c
 new file mode 100644
-index 0000000..4e137e8
+index 0000000..f985923
 --- /dev/null
 +++ b/pexpert/arm/land_sdhci.c
 @@ -0,0 +1,764 @@
@@ -544,6 +544,21 @@ index 0000000..4e137e8
 +	h[7] = (uint64_t)land_rca;
 +}
 +
++static void
++land_ram_tap(char c)
++{
++	if (land_ram == NULL) {
++		return;
++	}
++	land_ram[LAND_RAM_HDR + land_ram_used] = c;
++	land_ram_used = (land_ram_used + 1) % LAND_RAM_RING;
++	land_ram_total++;
++	if (c == '\n') {
++		land_ram_lines++;
++		land_ram_header();
++	}
++}
++
 +/*
 + * Called from arm_vm_init twice: once with the bootstrap alias (VA=PA region
 + * start.s builds) and once when the kernel's own alias is live.  The boot
@@ -581,21 +596,6 @@ index 0000000..4e137e8
 +		land_ram = NULL;
 +	}
 +	__asm__ volatile("dsb ishst" ::: "memory");
-+}
-+
-+static void
-+land_ram_tap(char c)
-+{
-+	if (land_ram == NULL) {
-+		return;
-+	}
-+	land_ram[LAND_RAM_HDR + land_ram_used] = c;
-+	land_ram_used = (land_ram_used + 1) % LAND_RAM_RING;
-+	land_ram_total++;
-+	if (c == '\n') {
-+		land_ram_lines++;
-+		land_ram_header();
-+	}
 +}
 +
 +/* ------------------------------------------------------------------ console
