@@ -575,10 +575,16 @@ land_ram_tap(char c)
 	}
 }
 
+/*
+ * The second argument is the number of hex digits to emit.  Every caller already
+ * counts digits, and the loop used to divide by four on the way in as well,
+ * which is why the cpu map printed "want 00" for 0x100 and the alias report
+ * printed four digits of a descriptor instead of sixteen.
+ */
 static void
-land_ram_hex(uint64_t v, int bits)
+land_ram_hex(uint64_t v, int digits)
 {
-	for (int i = bits - 4; i >= 0; i -= 4) {
+	for (int i = (digits - 1) * 4; i >= 0; i -= 4) {
 		land_ram_tap(land_hexdigits[(v >> i) & 0xf]);
 	}
 }

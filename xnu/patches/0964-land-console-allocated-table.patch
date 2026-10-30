@@ -1,0 +1,97 @@
+land: give the console alias a page table of its own
+
+The phone answered 0963 with "no l1" and "late no l1": the window the
+framebuffer alias asks for has no L2 table in the final kernel table at
+all, so both aliases have never existed and the retained console went dark
+at the page-table switch.  init_ptpages() describes the window instead,
+from the page-table pool the VM allocator never sees, and the console
+takes the block seven entries in - still keeping 0963's guard, because
+pmap can split a 2 MB block into a table and a stale alias would write
+into somebody else's page.
+---
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 184e02d..212dd1d 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1846,6 +1846,9 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define SWEET_EARLY_RAM_BLOCK_PA   0x86600000ULL
+ #define SWEET_EARLY_RAM_PAGE_OFF   0x1ff000ULL
+ #define SWEET_EARLY_RAM_BOOT_VA    (0x60000000ULL + (6 * ARM_TT_L2_SIZE) + SWEET_EARLY_RAM_PAGE_OFF)
++/* The same window the framebuffer alias asked for, seven blocks in: its L1
++ * entry is empty, so 0964 can give it a table of its own. */
++#define SWEET_EARLY_RAM_KVA        (SWEET_EARLY_FB_VA + (6 * ARM_TT_L2_SIZE))
+ static bool sweet_early_fb_mapped;
+ static bool sweet_early_ram_mapped;
+ static vm_map_address_t sweet_early_ram_va;
+@@ -1925,38 +1928,43 @@ sweet_early_map_final(void)
+ static void
+ land_console_map_kernel(void)
+ {
+-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
+-	unsigned int first, i;
+-
++	const vm_map_address_t va = SWEET_EARLY_RAM_KVA;
++	unsigned int l1i = (unsigned int)((va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT);
++	unsigned int idx;
++	tt_entry_t l1, entry;
++	tt_entry_t *l2;
++
++	/* 0963 asked this window for a table and found none: with 4 KiB pages one
++	 * L1 entry covers a whole gigabyte, and the kernel had not described this
++	 * one at all.  Describe it the way arm_vm_init describes its own - the page
++	 * comes out of the page-table pool, which the VM allocator never sees, so
++	 * whatever block entry goes into it stays ours for the rest of the boot. */
++	init_ptpages(cpu_tte, va, va + 1, FALSE, ARM_DYNAMIC_TABLE_XN |
++	    ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA));
++	l1 = cpu_tte[l1i];
+ 	if ((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) != (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE)) {
+-		land_vm_alias_report("late no l1", l1, 0);
++		land_vm_alias_report("still no table", l1, l1i);
+ 		return;
+ 	}
+-	{
+-		tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+-		tt_entry_t entry = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+-		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+-		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+-
+-		first = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
+-		for (i = TTE_PGENTRIES; i-- > 0;) {
+-			if (l2[i] != ARM_TTE_EMPTY) {
+-				continue;
+-			}
+-			l2[i] = entry;
+-			__asm__ volatile("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");
+-			sweet_early_ram_va = (va - ((vm_map_address_t)first * ARM_TT_L2_SIZE)) +
+-			    ((vm_map_address_t)i * ARM_TT_L2_SIZE) + SWEET_EARLY_RAM_PAGE_OFF;
+-			sweet_early_ram_aux = i;
+-			sweet_early_ram_mapped = true;
+-			land_ram_console_slot((uint64_t)&l2[i], (uint64_t)entry);
+-			land_vm_alias_report("late slot", i, (uint64_t)entry);
+-			return;
+-		}
+-		land_vm_alias_report("late none", first, TTE_PGENTRIES);
++	l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++	idx = (unsigned int)((va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT);
++	if (l2[idx] != ARM_TTE_EMPTY) {
++		/* A fresh table has nothing in it but the blocks this function writes,
++		 * so anything here already means the window is not free after all. */
++		land_vm_alias_report("taken", idx, l2[idx]);
++		return;
+ 	}
++	entry = SWEET_EARLY_RAM_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++	l2[idx] = entry;
++	__asm__ volatile("dsb ishst; tlbi vmalle1; dsb ish; isb" ::: "memory");
++	sweet_early_ram_va = va + SWEET_EARLY_RAM_PAGE_OFF;
++	sweet_early_ram_aux = idx;
++	sweet_early_ram_mapped = true;
++	land_ram_console_slot((uint64_t)&l2[idx], (uint64_t)entry);
++	land_vm_alias_report("table slot", l1i, (uint64_t)entry);
+ }
+ #endif
+ 
