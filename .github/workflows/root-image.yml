@@ -28,7 +28,7 @@ on:
       size_mb:
         description: "HFS+ volume size in MiB; land userdata is 25100 MiB"
         type: string
-        default: "7000"
+        default: "9000"
 
 concurrency:
   group: root-image
@@ -129,13 +129,10 @@ jobs:
           DIR=/Volumes/iOS
           test -d "$DIR" || { echo "volume did not automount"; exit 1; }
           # Things the first boot does not need: downloaded asset catalogs,
-          # fonts cache, wallpapers, per-device firmware bundles.  Individual
-          # compiled catalogs and ML weight blobs fail with errno 34 (Result too
-          # large) while being written into the HFS+ volume - gigabytes are
-          # still free at that point, so it is the file, not the space - and the
-          # rsync receiver dies on them, which costs the whole copy.  They are
-          # also the biggest things in the root, so skip everything over 32 MiB:
-          # nothing launchd or dyld needs is anywhere near that.
+          # fonts cache, wallpapers, per-device firmware bundles, and the machine
+          # learning weights.  Skipping files by size has to stay coarse: the
+          # first attempt capped at 32 MiB and the boot-set check below caught it
+          # eating UIKit, whose binary alone is larger than that.
           #
           # macOS still ships rsync 2.6.9 (see its own error paths in the log),
           # which has no ** patterns and no --max-size, so the size cap has to
@@ -157,8 +154,8 @@ jobs:
               --exclude '*.mlmodel*'
             )
           fi
-          find "$SRC" -xdev -type f -size +32M 2>/dev/null | sed "s#^$SRC/##" > big.txt || true
-          echo "files over 32 MiB skipped: $(wc -l < big.txt)"
+          find "$SRC" -xdev -type f -size +128M 2>/dev/null | sed "s#^$SRC/##" > big.txt || true
+          echo "files over 128 MiB skipped: $(wc -l < big.txt)"
           head -20 big.txt
           EXCLUDES+=( --exclude-from=big.txt )
           # shellcheck disable=SC2068
@@ -208,8 +205,15 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK"
-          split -b 400m root.hfs root.hfs.part-
+          # Most of a fresh volume is unallocated space, and an HFS+ image of
+          # zeros gzips down to about the size of its files: gigabytes of free
+          # room costs nothing to carry, which is the difference between a flash
+          # session and an afternoon of downloading.
+          rm -f root.hfs.gz root.hfs.part-*
+          gzip -1 -c root.hfs > root.hfs.gz
+          ls -lh root.hfs root.hfs.gz
           shasum -a 256 root.hfs | tee root.hfs.sha256
+          split -b 400m root.hfs.gz root.hfs.part-
           ls -l root.hfs.part-* | awk '{print $9, $5}'
 
       - name: Upload
