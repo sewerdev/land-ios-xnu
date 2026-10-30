@@ -491,9 +491,18 @@ land_put_hex(char *p, const char *label, uint64_t v, int bits)
 #define LAND_RAM_BYTES  4096u
 #define LAND_RAM_HDR    64u
 #define LAND_RAM_RING   (LAND_RAM_BYTES - LAND_RAM_HDR)
+/*
+ * The breadcrumb page is aliased by start.s next to the framebuffer console,
+ * so it is writable from the first line of any C that runs after the MMU is on
+ * - which is the whole point, since arm_init and the death we are chasing
+ * happen long before anything arms a console.  Must match SWEET_EARLY_RAM_* in
+ * osfmk/arm64/arm_vm_init.c and the block base in start.s.
+ */
+#define LAND_BRD_BOOT_VA 0x60de0000ULL
 
 static volatile char *land_ram;                 /* NULL until the alias exists */
-static volatile uint64_t *land_brd;             /* the page before it: stages */
+static volatile uint64_t *land_brd =            /* stages; live from arm_init */
+    (volatile uint64_t *)(uintptr_t)LAND_BRD_BOOT_VA;
 static unsigned int land_ram_used;              /* write cursor, mod ring size */
 static uint64_t land_ram_total;
 static uint64_t land_ram_boot;
