@@ -506,6 +506,8 @@ land_put_hex(char *p, const char *label, uint64_t v, int bits)
  * osfmk/arm64/arm_vm_init.c and the block base in start.s.
  */
 #define LAND_BRD_BOOT_VA 0x60dfe000ULL
+/* "LANDEMC1": the eMMC probe's fixed fields start at +0x80 of that page */
+#define LAND_PROBE_MAGIC 0x31434D45444E414CULL
 
 static volatile char *land_ram;                 /* NULL until the alias exists */
 static volatile uint64_t *land_brd =            /* stages; live from arm_init */
@@ -893,6 +895,9 @@ land_emmc_probe(void)
          * mirror and the marks stay off until this point for exactly that reason.
          */
         land_armed = 1;
+        /* A stage of 9 in the breadcrumb page is the proof the probe ran even if
+         * the fields below never get written, because no console alias existed. */
+        land_boot_mark(9);
         if (SecureDTFindEntry("name", "emmc", &entryP) == kSuccess) {
                 if ((SecureDTGetProperty(entryP, "land,root-lba", &value, &prop_size) == kSuccess) &&
                     prop_size == sizeof(uint32_t)) {
@@ -920,4 +925,30 @@ land_emmc_probe(void)
                     (unsigned long)land_log_total);
         }
         land_log_flush();
+
+        /*
+         * The console ring holds 4 KiB and one boot writes more than that, so the
+         * lines above are usually gone by the time the shim lifts the page - and
+         * whether the card came up is exactly what the next decision needs.  The
+         * same facts go into fixed fields of the breadcrumb page, which never
+         * moves and which the shim already copies whole (dip blocks 32..39), so a
+         * boot that dies two drivers later still answers.  Through land_brd, not
+         * the bootstrap constant: by now the alias is the kernel's own, and it is
+         * NULL on the path where no alias was made.
+         */
+        if (land_brd != NULL) {
+                volatile uint64_t *p = &land_brd[16];
+
+                p[0] = LAND_PROBE_MAGIC;
+                p[1] = (uint64_t)land_card_ready;
+                p[2] = land_rca;
+                p[3] = land_faults;
+                p[4] = (uint64_t)(int64_t)rc;
+                p[5] = (uint64_t)land_hc;
+                p[6] = land_root_lba;
+                p[7] = land_root_bytes;
+                p[8] = (uint64_t)land_log_seq;
+                p[9] = land_log_total;
+                __asm__ volatile("dsb sy" ::: "memory");
+        }
 }
