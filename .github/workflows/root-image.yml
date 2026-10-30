@@ -167,15 +167,25 @@ jobs:
             exit 1
           fi
           # The size cap is a blunt instrument, so name what it must not have
-          # cost.  If one of these is gone the image cannot boot and the copy
-          # rules have to change, not the check.
+          # cost.  iOS 16 keeps its framework binaries in the dyld shared cache
+          # instead of as files, so requiring UIKit.framework/UIKit would fail a
+          # good image: only what the source actually has is required, and the
+          # rest is reported.
           for need in sbin/launchd usr/lib/dyld usr/libexec/securityd \
                       System/Library/CoreServices/SpringBoard.app/SpringBoard \
                       System/Library/Frameworks/UIKit.framework/UIKit \
                       System/Library/Frameworks/Foundation.framework/Foundation; do
-            test -f "$DIR/$need" || { echo "missing from the image: $need"; exit 1; }
+            if [ ! -e "$SRC/$need" ]; then
+                echo "source has no $need (dyld cache only), not required"
+            elif [ ! -f "$DIR/$need" ]; then
+                echo "missing from the image although the source has it: $need"
+                ls -l "$SRC/$need"
+                exit 1
+            else
+                echo "carried: $need"
+            fi
           done
-          echo "boot set present"
+          ls -l "$SRC/System/Library/Frameworks/UIKit.framework" 2>/dev/null | head -6
           mkdir -p "$DIR/dev" "$DIR/proc" "$DIR/tmp"
           sync
           hdiutil detach /Volumes/iOS
