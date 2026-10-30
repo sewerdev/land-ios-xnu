@@ -56,30 +56,53 @@ jobs:
         # The script reads only the central directory first, then streams the
         # member, and refuses a compressed member (a range fetch needs stored).
 
-      - name: Decode the UDIF and mount the APFS container
+      - name: Mount the DMG (hdiutil decodes UDIF, APFS mounts natively)
         run: |
           set -euo pipefail
           cd "$WORK"
-          hdiutil expand -format RAW ./volume.dmg -o container.raw
-          ls -lh container.raw
-          # macOS reads APFS natively, so no fuse helper is involved: try each
-          # device the attach reports until one mounts read-only.
-          hdiutil attach -readonly -nomount container.raw > devs.txt
+          # There is no "hdiutil expand": attach the UDIF instead. hdiutildecodes
+          # its chunks (LZFSE included) on the fly and the APFS volume inside is
+          # mounted by the system driver, so no fuse helper and no 5.6 GB copy.
+          hdiutil attach -readonly -nomount ./volume.dmg > devs.txt
           cat devs.txt
-          mkdir -p mnt
-          mounted=""
-          for cand in $(awk '{print $NF}' devs.txt | grep '^/dev/disk' | tac); do
-            if mount -t apfs -o ro "$cand" mnt 2>/dev/null; then mounted="$cand"; break; fi
+          PARENT=$(awk '/^[[:space:]]*\/dev\/disk/ {print $1; exit}' devs.txt)
+          test -n "$PARENT" || { echo "no /dev/diskN from attach"; exit 1; }
+          # the APFS container shows up as <parent>sN; ask diskutil which of them
+          # holds the System volume, then let the system mount it read-only
+          diskutil list "$PARENT"
+          VOL=""
+          for cand in $(diskutil list -plist "$PARENT" 2>/dev/null \
+              | grep -o '/dev/disk[0-9]*s[0-9]*' | sort -u); do
+            if mount -t apfs -o ro "$cand" /mnt 2>/dev/null; then VOL="$cand"; break; fi
           done
-          test -n "$mounted" || { diskutil list; exit 1; }
-          echo "mounted $mounted"
-          du -sh mnt
-          ls mnt
+          if [ -z "$VOL" ]; then
+            # fall back to auto-mounting the whole image and finding the volume
+            hdiutil detach "$PARENT" -force >/dev/null 2>&1 || true
+            hdiutil attach -readonly ./volume.dmg > mounted.txt
+            cat mounted.txt
+            VOL=$(awk '/\/dev\/disk/ {print $1}' mounted.txt | tail -1)
+          fi
+          echo "$VOL" > volume.dev
+          SRC=""
+          for v in /Volumes/*; do
+            [ -d "$v/System/Library/CoreServices" ] && SRC="$v"
+          done
+          if [ -z "$SRC" ]; then
+            mkdir -p mnt
+            mount -t apfs -o ro "$VOL" mnt || { diskutil list; exit 1; }
+            SRC="$PWD/mnt"
+          fi
+          test -d "$SRC/System/Library" || { echo "no System/Library under $SRC"; ls -l "$SRC"; exit 1; }
+          echo "$SRC" > src.dir
+          echo "source volume: $SRC"
+          du -sh "$SRC" 2>/dev/null | tail -1
+          ls "$SRC"
 
       - name: Format HFS+ and copy the payload
         run: |
           set -euo pipefail
           cd "$WORK"
+          SRC=$(cat src.dir)
           df -h . | tail -1
           dd if=/dev/zero of=root.hfs bs=1m count=8192
           # case-sensitive: iOS paths are case-sensitive and dyld expects it
@@ -88,7 +111,7 @@ jobs:
           DIR=$(mktemp -d)
           mount -t hfs "$DEV" "$DIR"
           if [ "${{ inputs.subset }}" = all ]; then
-            rsync -a mnt/ "$DIR"/
+            rsync -a "$SRC"/ "$DIR"/
           else
             # Things the first boot does not need: downloaded asset catalogs,
             # fonts cache, wallpapers, per-device firmware bundles.
@@ -102,7 +125,7 @@ jobs:
               --exclude 'System/Library/Components/' \
               --exclude 'System/Library/LocationBundles/' \
               --exclude 'System/Library/PrivateFrameworks/AssistantServices/' \
-              mnt/ "$DIR"/
+              "$SRC"/ "$DIR"/
           fi
           mkdir -p "$DIR/dev" "$DIR/proc" "$DIR/tmp"
           sync
