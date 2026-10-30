@@ -39,7 +39,10 @@ permissions:
 
 jobs:
   hfs:
-    runs-on: macos-14
+    # off macos-14 with xnu.yml: GitHub retires that image on 2026-11-02 and its
+    # brownout cancels jobs seconds after they start.  Everything here is hdiutil,
+    # ditto and diskutil, all present on macos-13.
+    runs-on: macos-13
     timeout-minutes: 150
     env:
       WORK: ${{ github.workspace }}/work
