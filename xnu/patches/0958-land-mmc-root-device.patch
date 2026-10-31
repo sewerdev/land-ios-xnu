@@ -17,10 +17,10 @@ index c2864ab..e3be110 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/land_mmc.c b/bsd/dev/land_mmc.c
 new file mode 100644
-index 0000000..a54aa73
+index 0000000..2e4404e
 --- /dev/null
 +++ b/bsd/dev/land_mmc.c
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,311 @@
 +/*
 + * land (Redmi 3S, MSM8937): read-only BSD block device over the SDHCI eMMC.
 + *
@@ -44,7 +44,6 @@ index 0000000..a54aa73
 +#include <sys/systm.h>
 +#include <sys/buf.h>
 +#include <sys/conf.h>
-+#include <sys/dkio.h>
 +#include <sys/disk.h>
 +#include <sys/errno.h>
 +#include <sys/proc.h>
@@ -165,7 +164,6 @@ index 0000000..a54aa73
 +land_mmc_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
 +    __unused struct proc *p, int is_char)
 +{
-+	struct dk_mediainfo *mi = (struct dk_mediainfo *)data;
 +	uint32_t *f = (uint32_t *)data;
 +	uint64_t *o = (uint64_t *)data;
 +
@@ -205,20 +203,11 @@ index 0000000..a54aa73
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
 +		*o = 1;
 +		return 0;
-+	case DKIOCGMEDIAINFOEXT:
-+		mi->dmi_media = 1;                   /* DMT_FIXED */
-+		mi->dmi_flags = 0;
-+		mi->dmi_block_size = lm.secsize;
-+		mi->dmi_physical_block_size = MMC_BLOCK;
-+		mi->dmi_bytes = lm.nblocks * MMC_BLOCK;
-+		return 0;
-+	case DKIOCGMEDIAINFO:
-+		((struct dk_media *)data)->dmi_media = 1;
-+		((struct dk_media *)data)->dmi_flags = 0;
-+		((struct dk_media *)data)->dmi_block_size = lm.secsize;
-+		((struct dk_media *)data)->dmi_bytes = (uint32_t)
-+		    MIN(lm.nblocks * MMC_BLOCK / lm.secsize, 0xffffffffu);
-+		return 0;
++	/* DKIOCGMEDIAINFO and DKIOCGMEDIAINFOEXT are FreeBSD media descriptors;
++	 * this tree declares its ioctls in sys/disk.h and has no such pair, so
++	 * hfsplus gets block size and count from the cases above, the way
++	 * sweet_ufs.c does.
++	*/
 +	default:
 +		return ENOTTY;
 +	}
