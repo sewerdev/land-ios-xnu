@@ -1,0 +1,477 @@
+#!/bin/sh
+# Boot probe for the EndeavourOS root on land (Redmi 3S).
+#
+# The kernel is the 4.19.325-Mi8937v2 taken out of the LineageOS 18 boot image and
+# there is no keyboard, no serial cable and no adbd here, so the only output is the
+# panel (console=tty0 fbcon=map:1) and the only way a PC can read anything later is
+# a journal written to a partition that TWRP mounts.  This script therefore has to
+# answer its own questions and then get the phone back to TWRP by itself.
+#
+# Getting back is the interesting part.  aboot on this board does not act on a
+# recovery command in misc: boot-recovery was written at offset 0 and at 0x400, and
+# the phone rebooted into this script instead.  Copying the recovery image into boot
+# does not work either, because aboot then tells TWRP it is a normal boot and TWRP
+# never brings up adb.  What does work is the RESTART2 argument: write "recovery" to
+# /sys/reboot/cmd and reboot, which is how Android's own reboot-to-recovery is done.
+# Everything the probe learns also goes to the dip partition raw, so a boot can be
+# read from the PC even when no filesystem could be mounted.
+PATH=/bin:/sbin
+OUT=/dev/console
+
+say() {
+	echo "$*" >"$OUT" 2>/dev/null
+	# The framebuffer is the only thing on this board that can show a word: the
+	# kernel has no VT and no fbcon, so every line has to be redrawn as pixels.
+	printf '%s\n' "$*" >>"$SCR" 2>/dev/null
+	fbprint --scale 3 <"$SCR" 2>/dev/null
+}
+
+# Where to keep the scratch files.  The phone's initramfs has a plain /tmp, but the
+# same script is also run under qemu against an Alpine initramfs, and there /tmp can
+# be a symlink to a directory that does not exist yet, which makes mkdir -p fail and
+# a POSIX shell exit on the very first redirection.  So the first usable directory
+# wins, and / is always there because the initramfs root is a ramfs.
+SCRDIR=/
+for d in /tmp /run /var/tmp; do
+	( mkdir -p "$d" 2>/dev/null && : >"$d/.landprobe" 2>/dev/null ) &&
+		rm -f "$d/.landprobe" 2>/dev/null && SCRDIR=$d && break
+done
+SCR=$SCRDIR/scr
+: >"$SCR" 2>/dev/null
+
+PREVN=$(dd if="$JOURNALDEV" bs=512 skip=5 count=1 2>/dev/null |
+	tr -d '\000' | sed -n 's/^LANDPROBE-START n=\([0-9]*\).*/\1/p')
+[ -n "$PREVN" ] || PREVN=0
+if [ "$PREVN" -ge 3 ]; then
+	# Three boots in a row that got this far and did not finish: stop trying and
+	# leave the phone switched off, which is recoverable by a button, unlike a loop
+	# that drains the battery.
+	say "previous attempt was $PREVN, refusing to reboot again"
+	STUCK=1
+else
+	STUCK=0
+fi
+
+# This kernel has no devtmpfs (CONFIG_DEVTMPFS is not set), so the block nodes
+# have to be made here from what the mmc driver registered.  /proc/partitions is
+# readable without any /dev at all, which makes it the source of the numbers.
+mknode() { # mknode <name>: create /dev/block/<name> from /proc/partitions
+	local nm=$1 rec maj min
+	rec=$(grep -w "$nm" /proc/partitions 2>/dev/null | head -1)
+	[ -n "$rec" ] || return 1
+	set -- $rec
+	maj=$1
+	min=$2
+	[ -b "/dev/block/$nm" ] && return 0
+	mknod "/dev/block/$nm" b "$maj" "$min" 2>/dev/null
+	[ -b "/dev/block/$nm" ]
+}
+
+mkdir -p /dev 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+# devtmpfs is not compiled into this kernel, so /dev is a plain directory of the
+# initramfs.  mount --move only works on a mount, and handing systemd an empty /dev
+# is worse than not trying, so /dev becomes a tmpfs here and keeps its essential
+# nodes by hand.
+mount -t tmpfs tmpfs /dev 2>/dev/null
+for n in console:char:5:1 null:char:1:3 zero:char:1:5 tty:char:5:0 urandom:char:1:9 random:char:1:8; do
+	name=${n%%:*}
+	rest=${n#*:}
+	type=${rest%%:*}
+	rest=${rest#*:}
+	maj=${rest%%:*}
+	min=${rest#*:}
+	[ -e "/dev/$name" ] || mknod "/dev/$name" "$type" "$maj" "$min" 2>/dev/null
+done
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mkdir -p /mnt/c /mnt/r /dev/block /tmp 2>/dev/null
+
+# Which partitions stand for root, cache and the journal is taken from the kernel
+# command line, with the phone's own numbers as the default.  That is what lets the
+# same initramfs be tested under qemu against a virtio disk instead of only on the
+# device: landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc landnoreboot.
+ROOTDEV=/dev/block/mmcblk0p49
+CACHEDEV=/dev/block/mmcblk0p25
+JOURNALDEV=/dev/block/mmcblk0p33
+NOREBOOT=0
+PKGTEST=0
+TRY_SYSTEMD=0
+TRY_INIT=0
+WATCHDOG=150
+for a in $(cat /proc/cmdline 2>/dev/null); do
+	case "$a" in
+	landroot=*) ROOTDEV=${a#landroot=} ;;
+	landcache=*) CACHEDEV=${a#landcache=} ;;
+	landjournal=*) JOURNALDEV=${a#landjournal=} ;;
+	landnoreboot) NOREBOOT=1 ;;
+	landpkgtest) PKGTEST=1; WATCHDOG=900 ;;
+	landsystemd) TRY_SYSTEMD=1 ;;
+	landinit) TRY_INIT=1 ;;
+	esac
+done
+# Everything is addressed as /dev/block/<name> because that is where the nodes are
+# made: this kernel has no devtmpfs, so the name the caller used on the command line
+# only says which partition, not which path the node ends up at.
+ROOTDEV=/dev/block/${ROOTDEV##*/}
+CACHEDEV=/dev/block/${CACHEDEV##*/}
+JOURNALDEV=/dev/block/${JOURNALDEV##*/}
+
+NODES="$ROOTDEV $CACHEDEV $JOURNALDEV"
+for n in $NODES; do
+	mknode "${n##*/}"
+done
+
+# Nothing here can be watched over a screen, so the script watches itself.  If it
+# gets stuck (a corrupted filesystem can stall a mount indefinitely) this timer bites
+# the sysrq reboot and aboot starts the probe again; the attempt counter below then
+# stops the loop after three tries.  A normal run reaches its own reboot in well
+# under a minute, so the timer never fires on purpose.
+(
+	# The watchdog has to outlast the longest legitimate step, which is a package
+	# download over a network that may be slow, not dead.
+	sleep $WATCHDOG
+	echo u >/proc/sysrq-trigger 2>/dev/null
+	echo b >/proc/sysrq-trigger 2>/dev/null
+) &
+
+# The attempt count is also read out of the dip record of the previous boot, because
+# that much is available even when no filesystem could be mounted: without it a probe
+# that hangs before touching /cache would reboot into itself forever.
+
+# /dev/fb0 is char 29:0 on any fbdev driver; mdev makes the same node from
+# /sys/class/graphics, this is only for the case where it cannot.
+[ -e /dev/fb0 ] || mknod /dev/fb0 c 29 0 2>/dev/null
+
+# mdev fills /dev from /sys, which is the only way to get a real /dev on this
+# kernel: it has no devtmpfs to mount and there is no ueventd here to do it.
+# Without it the distro has no console, no input and no loop devices.
+mdev -s 2>/dev/null
+for d in dev/shm run sys proc tmp var/tmp; do
+	mkdir -p "/mnt/r/$d" 2>/dev/null
+done
+
+# cache is f2fs on this build (TWRP mounts mmcblk0p25 as f2fs), not ext4, and the
+# probe has to match that or it has nowhere to write.  Nothing else touches it
+# during a probe boot, which is why the journal goes there rather than into the
+# root being tested.
+CACHE=none
+if mount -t f2fs "$CACHEDEV" /mnt/c 2>/dev/null; then
+	CACHE=f2fs
+elif mount -t ext4 "$CACHEDEV" /mnt/c 2>/dev/null; then
+	CACHE=ext4
+fi
+
+N=1
+if [ "$CACHE" != none ]; then
+	N=$(cat /mnt/c/land-attempts 2>/dev/null)
+	[ -n "$N" ] || N=1
+	N=$((N + 1))
+	echo "$N" >/mnt/c/land-attempts
+fi
+# The journal is always composed in the initramfs first, then copied to wherever it
+# can be read from: dip is 1 MiB and is written raw, so it survives even when the
+# cache filesystem is not something this kernel can mount.
+LOG=$SCRDIR/jr
+
+say ""
+say "land EOS probe attempt $N, cache=$CACHE"
+say "nodes: $(ls /dev/block 2>/dev/null | tr '\n' ' ')"
+# Written before anything that can fail: if this record exists and the later one
+# does not, the probe died in the middle rather than never starting.
+printf 'LANDPROBE-START n=%s cache=%s nodes=%s\n' "$N" "$CACHE" \
+	"$(ls /dev/block 2>/dev/null | tr '\n' ' ')" |
+	dd of="$JOURNALDEV" bs=512 count=1 seek=5 conv=notrunc 2>/dev/null
+
+# adb over the USB gadget, when this initramfs carries adbd.  The LOS 18 kernel has
+# configfs and functionfs built in (CONFIG_USB_CONFIGFS=y, CONFIG_USB_F_FS=y), which
+# is the same transport Android uses, so the phone can be reached over adb from a
+# distro boot instead of only from TWRP.  Everything it needs comes from /system via
+# pull_adbd.sh.  The order is the one Android's init uses: make the function, mount
+# functionfs on it, start adbd so the descriptors get written, then bind the UDC.
+ADBERR=absent
+start_adb() {
+	[ -x /bin/adbd ] || { ADBERR=no-adbd; return 1; }
+	U=$(ls /sys/class/udc 2>/dev/null | head -1)
+	[ -n "$U" ] || { ADBERR=no-udc; return 1; }
+	G=/sys/kernel/config/usb_gadget/g1
+	mkdir -p "$G" 2>/dev/null || { ADBERR=no-configfs; return 1; }
+	echo 0x18d1 >"$G/idVendor" 2>/dev/null
+	echo 0x4e40 >"$G/idProduct" 2>/dev/null
+	mkdir -p "$G/strings/0x409" 2>/dev/null
+	echo land >"$G/strings/0x409/serialnumber" 2>/dev/null
+	echo Xiaomi >"$G/strings/0x409/manufacturer" 2>/dev/null
+	echo "Redmi 3S" >"$G/strings/0x409/product" 2>/dev/null
+	mkdir -p "$G/functions/ffs.adb" 2>/dev/null || { ADBERR=no-ffs; return 1; }
+	mkdir -p /dev/usb-ffs/adb 2>/dev/null
+	mount -t functionfs adb /dev/usb-ffs/adb 2>/dev/null || { ADBERR=no-ffsmount; return 1; }
+	mkdir -p "$G/configs/b.1/strings/0x409" 2>/dev/null
+	echo 1 >"$G/configs/b.1/MaxPower" 2>/dev/null
+	ln -s "$G/functions/ffs.adb" "$G/configs/b.1/ffs.adb" 2>/dev/null
+	/bin/adbd >/dev/null 2>&1 &
+	sleep 2
+	echo "$U" >"$G/UDC" 2>/dev/null || { ADBERR=no-bind; return 1; }
+	ADBERR=ok
+	return 0
+}
+
+CODE=NO-BLKDEV
+MAGIC=none
+FSINFO=none
+OSR=none
+PKGS=0
+EOSPKGS=0
+SYSTEMD=no
+ROK=0
+DEVOK=0
+if [ -b "$ROOTDEV" ]; then
+	DEVOK=1
+else
+	say "no mmcblk0p49, kernel has no mmc root device"
+fi
+
+if [ "$DEVOK" = 1 ]; then
+	MAGIC=$(dd if="$ROOTDEV" bs=4096 count=1 2>/dev/null |
+		od -An -tx1 -j1080 -N2 | tr -d ' \n')
+	if mount -t ext4 "$ROOTDEV" /mnt/r 2>/dev/null; then
+		ROK=1
+		CODE=ROOT-MOUNTED
+	elif mount -t ext4 -o ro,noload "$ROOTDEV" /mnt/r 2>/dev/null; then
+		# The journal mkfs made is mostly zero-filled blocks, and a zero-filled
+		# block in the packed image is a hole, so what lands on the partition is
+		# whatever was there before.  noload mounts the root anyway, which is how
+		# the difference between "the image is broken" and "the journal is broken"
+		# gets told apart from a phone nobody can look at.
+		ROK=1
+		CODE=ROOT-MOUNTED-NOLOAD
+	fi
+fi
+say "p49 magic=$MAGIC mounted=$ROK"
+if [ "$DEVOK" = 1 ] && [ "$ROK" = 0 ]; then
+	# The node exists and the superblock was read but the mount was refused, which
+	# on a kernel without the filesystem compiled in looks exactly like a dead disk.
+	CODE=ROOT-MOUNT-FAILED
+fi
+
+if [ "$ROK" = 1 ]; then
+	FSINFO=$(df /mnt/r 2>/dev/null | tail -1 | tr -s ' ')
+	OSR=$(grep '^PRETTY_NAME=' /mnt/r/etc/os-release 2>/dev/null |
+		head -1 | tr -d '\r')
+	say "$OSR"
+	say "fs: $FSINFO"
+	# chroot rather than switch_root on purpose: the probe stays in the initramfs,
+	# so it can still write the journal and hand the phone back afterwards.
+	PKGS=$(chroot /mnt/r /bin/sh -c 'pacman -Q 2>/dev/null | wc -l' 2>&1)
+	CERR=$(chroot /mnt/r /bin/sh -c 'pacman -Q >/dev/null' 2>&1 | head -1)
+	EOSPKGS=$(chroot /mnt/r /bin/sh -c \
+		'pacman -Q 2>/dev/null | grep -ciE "endeavouros|^eos-|^yay |^paru "' \
+		2>/dev/null)
+	say "pacman: $PKGS packages, $EOSPKGS of them EndeavourOS"
+	[ -n "$CERR" ] && say "chroot said: $CERR"
+	[ -x /mnt/r/lib/systemd/systemd ] && SYSTEMD=yes
+	say "systemd binary present: $SYSTEMD"
+	if [ "$PKGS" -gt 0 ] 2>/dev/null; then
+		CODE=EOS-ROOT-OK
+	else
+		CODE=ROOT-MOUNTED-NO-PACKDB
+	fi
+fi
+
+{
+	echo "=== land EOS probe $N ==="
+	echo "uname: $(uname -a)"
+	echo "cmdline: $(cat /proc/cmdline)"
+	echo "magic=$MAGIC mounted=$ROK cache=$CACHE"
+	echo "fs: $FSINFO"
+	echo "os-release: $OSR"
+	echo "packages: $PKGS endeavouros: $EOSPKGS systemd: $SYSTEMD"
+	echo "adb: $ADBERR"
+	echo "chroot error: $CERR"
+	echo "nodes in /dev/block: $(ls /dev/block 2>/dev/null)"
+	echo "partitions:"
+	cat /proc/partitions
+	echo "mounts:"
+	cat /proc/mounts
+	echo "--- dmesg ---"
+	dmesg
+	echo "CODE=$CODE"
+} >"$LOG" 2>&1
+sync
+
+say ""
+say "CODE=$CODE"
+
+# dip is the channel that cannot be lost: 1 MiB of raw partition, read back from
+# recovery with dd if="$JOURNALDEV" bs=512 skip=2 count=200.  The journal
+# goes there at record 2, the one-line status at record 4, and the start marker
+# (written before anything that can fail) at record 5, so the difference between
+# "userspace never started", "started and died here" and "finished" is readable even
+# when the cache filesystem is not mountable.
+if [ "$CACHE" != none ]; then
+	cp "$LOG" "/mnt/c/land-boot-$N.log" 2>/dev/null
+	sync
+fi
+dd if="$LOG" of="$JOURNALDEV" bs=512 seek=2 conv=notrunc 2>/dev/null
+printf 'LANDPROBE n=%s code=%s cache=%s root=%s pkgs=%s eos=%s err=%.40s\n' \
+	"$N" "$CODE" "$CACHE" "$ROK" "$PKGS" "$EOSPKGS" "$CERR" |
+	dd of="$JOURNALDEV" bs=512 count=1 seek=4 conv=notrunc 2>/dev/null
+sync
+
+# The package test: does the installed system still work as a package manager,
+# end to end.  It needs a network, which the phone does not have in this boot but
+# the qemu harness does, so it is driven by landpkgtest on the command line.  This
+# is the step that separates "a filesystem that mounts" from "EndeavourOS runs":
+# synchronizing the repositories exercises the EndeavourOS keyring and the
+# SigLevel of a repository that has no signed database, and installing something
+# exercises the mirror, the signature check and the scriptlets.
+if [ "$PKGTEST" = 1 ] && [ "$ROK" = 1 ]; then
+	{
+		echo "=== package test ==="
+		# pacman asks the package library how much room the filesystem has, and that
+		# reads /proc/mounts through /etc/mtab.  Inside a chroot with no /proc the
+		# transaction dies with "could not determine filesystem mount points" before
+		# anything is downloaded, which is what the first run of this test hit.
+		# bind, not --move: moving /dev away from the initramfs takes the very
+		# nodes this script still writes its journal through, and the dd below then
+		# fails in silence.
+		mount --bind /dev /mnt/r/dev 2>/dev/null
+		mount --bind /proc /mnt/r/proc 2>/dev/null
+		mount --bind /sys /mnt/r/sys 2>/dev/null
+		[ -e /mnt/r/etc/mtab ] || ln -s /proc/mounts /mnt/r/etc/mtab 2>/dev/null
+		echo "interfaces: $(ls /sys/class/net 2>/dev/null | tr '\n' ' ')"
+		for i in $(ls /sys/class/net 2>/dev/null); do
+			[ "$i" = lo ] && continue
+			udhcpc -i "$i" -n -q 2>&1 | tail -1
+			# busybox udhcpc asks for an AF_PACKET socket, and a kernel built without
+			# CONFIG_PACKET cannot do DHCP at all.  qemu's user mode networking is a
+			# fixed little subnet, so the address can simply be taken instead:
+			# 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3.
+			if ! ip -4 -o addr show dev "$i" 2>/dev/null | grep -q 'inet '; then
+				echo "no lease on $i, taking the qemu static address"
+				ifconfig "$i" 10.0.2.15 netmask 255.255.255.0 up 2>/dev/null
+				ip route add default via 10.0.2.2 dev "$i" 2>/dev/null
+			fi
+		done
+		[ -s /etc/resolv.conf ] || echo "nameserver 10.0.2.3" >/etc/resolv.conf 2>/dev/null
+		ping -c 1 -W 3 10.0.2.3 >/dev/null 2>&1 && echo "gateway reachable" ||
+			echo "gateway unreachable"
+		# The resolver is copied after udhcpc wrote it, not before: doing it first
+		# left an empty file and every mirror came back "Could not resolve host".
+		cp /etc/resolv.conf /mnt/r/etc/resolv.conf 2>/dev/null
+		ifconfig 2>/dev/null | head -12
+		chroot /mnt/r /bin/sh -c 'head -3 /etc/resolv.conf; timeout 300 pacman -Sy --noconfirm 2>&1 | tail -8'
+		chroot /mnt/r /bin/sh -c 'timeout 300 pacman -S --noconfirm --needed --disable-download-timeout tree 2>&1 | tail -14'
+		chroot /mnt/r /bin/sh -c 'echo "tree-record: $(pacman -Q tree)"; echo "tree-version: $(tree --version 2>&1)"'
+	} >>"$LOG" 2>&1
+	sync
+	# Rewrite the copies now that the journal carries the test result.
+	if [ "$CACHE" != none ]; then
+		cp "$LOG" "/mnt/c/land-boot-$N.log" 2>/dev/null
+	fi
+	# Not redirected into $LOG: that file is what this dd is reading.
+	dd if="$LOG" of="$JOURNALDEV" bs=512 seek=2 conv=notrunc 2>/dev/null
+	sync
+	say "package test appended to the journal"
+fi
+
+# If adb came up, this is the better place to stop: the PC can read the journal over
+# adb, run anything in the distro, and send the phone back to recovery with
+# adb reboot recovery.  Handing back to TWRP is only needed when there is no adb.
+start_adb
+say "adb=$ADBERR"
+if [ "$ADBERR" = ok ]; then
+	say "staying up with adb, CODE=$CODE-ADB"
+	# A shell that restarts when it exits: if it were exec'd, closing it would take
+	# the kernel down with it.
+	while :; do
+		/bin/sh </dev/console >/dev/console 2>&1
+		sleep 5
+	done
+fi
+
+# The next milestone, also gated on a file so the first boots stay a probe: a panic
+# inside systemd leaves no pid 1 to write the journal and no handback, so systemd
+# only gets tried once the mount itself has been read from the PC side.
+handover() { # move the API filesystems into the new root and get out of the way
+	for d in proc sys dev run tmp var/tmp sys/fs/cgroup dev/shm; do
+		mkdir -p "/mnt/r/$d" 2>/dev/null
+	done
+	mount --move /proc /mnt/r/proc 2>/dev/null
+	mount --move /sys /mnt/r/sys 2>/dev/null
+	# /dev is a tmpfs the probe filled with mknod and mdev, so it can be moved and
+	# the new root finds a populated device tree.
+	mount --move /dev /mnt/r/dev 2>/dev/null
+	# cgroup is what systemd insists on, and this kernel is older than the unified
+	# hierarchy's default, so try v2 and fall back to v1 rather than letting pid 1
+	# fail on its own.
+	mount -t cgroup2 none /mnt/r/sys/fs/cgroup 2>/dev/null ||
+		mount -t cgroup none /mnt/r/sys/fs/cgroup 2>/dev/null
+	mount -t tmpfs shm /mnt/r/dev/shm 2>/dev/null
+	sync
+}
+
+# The root ships a landinit.sh that is a PID 1 this kernel can actually run: the
+# stock 4.19 build has no CONFIG_FHANDLE, no cgroup device or pids controller and
+# no POSIX mqueue, and systemd refuses to start without name_to_handle_at.  So the
+# default handover is that script, and systemd is only tried when asked for.
+# Either the command line or the file /cache/land-init-boot asks for this, so the
+# handover can be switched on from the PC without reflashing the boot image.
+if { [ "$TRY_INIT" = 1 ] || [ -f /mnt/c/land-init-boot ]; } && [ "$ROK" = 1 ] &&
+	[ -x /mnt/r/landinit.sh ]; then
+	say "handing the phone to the root's own init"
+	handover
+	exec /sbin/switch_root /mnt/r /landinit.sh
+	say "switch_root failed, CODE=SWITCH-ROOT-FAILED"
+fi
+
+if { [ -f /mnt/c/land-systemd-boot ] || [ "$TRY_SYSTEMD" = 1 ]; } && [ "$ROK" = 1 ] &&
+	[ "$SYSTEMD" = yes ]; then
+	say "handing the phone to systemd"
+	handover
+	exec /sbin/switch_root /mnt/r /lib/systemd/systemd
+	say "switch_root failed, CODE=SWITCH-ROOT-FAILED"
+fi
+
+# /cache/land-stay keeps the distro running for interactive work; without that file
+# every probe boot ends back in TWRP with adb on the PC side.
+if [ -f /mnt/c/land-stay ]; then
+	say "land-stay present, staying up: CODE=$CODE"
+	while :; do sleep 60; done
+fi
+
+RC=0
+HBM=none
+# /sys/reboot/cmd is how a kernel restart takes the RESTART2 argument, and writing
+# "recovery" there is exactly what Android's own reboot-to-recovery does: the
+# power-on reason is set in shared memory and aboot boots the recovery partition.
+# Copying the recovery image into boot instead, which is what this used to do, does
+# not work: aboot tells the image it is a normal boot, and TWRP's init does not come
+# up as a console over adb from that state.
+if echo recovery >/sys/reboot/cmd 2>/dev/null; then
+	HBM=sysfs
+	say "handback through /sys/reboot/cmd"
+fi
+printf 'LANDPROBE-HB n=%s mode=%s code=%s\n' "$N" "$HBM" "$CODE" |
+	dd of="$JOURNALDEV" bs=512 count=1 seek=3 conv=notrunc 2>/dev/null
+umount /mnt/r 2>/dev/null
+umount /mnt/c 2>/dev/null
+sync
+if [ "$STUCK" = 1 ]; then
+	# The dip counter said a previous boot did not finish: do not add another one.
+	say "CODE=$CODE stuck=$STUCK, powering off for a human"
+	poweroff -f
+fi
+if [ "$NOREBOOT" = 1 ]; then
+	say "landnoreboot set, CODE=$CODE, powering off instead of rebooting"
+	poweroff -f
+fi
+if [ "$HBM" = none ]; then
+	# Without a way back to recovery, rebooting normally would run this script
+	# again forever.  Powering off leaves one button press to do on purpose.
+	say "no reboot-to-recovery channel, CODE=$CODE, powering off"
+	poweroff -f
+fi
+reboot -f
+
+say "reboot failed, CODE=REBOOT-FAILED"
+while :; do sleep 60; done
