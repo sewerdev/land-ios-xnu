@@ -37,9 +37,11 @@ jobs:
       - name: Build musl static inside a real aarch64 container
         run: |
           set -euo pipefail
-          # linux-headers is where <linux/fb.h> lives, and without it fbprint falls
-          # back to its own copy of the structs rather than the kernel's.
-          docker run --rm -v "$GITHUB_WORKSPACE":/work alpine:3.20 sh -c '
+          # --platform is not decoration: without it docker pulls the amd64 alpine on
+          # an x86_64 runner, gcc there is an x86_64 gcc, and the build "succeeds" as
+          # an x86_64 binary that the phone can never exec.
+          docker run --rm --platform linux/arm64 -v "$GITHUB_WORKSPACE":/work \
+            alpine:3.20 sh -c '
             apk add --no-cache gcc musl-dev linux-headers >/dev/null &&
             gcc -O2 -static -Wall -Wextra \
               -I /work/probe -o /work/fbprint-musl /work/probe/fbprint.c &&
@@ -67,6 +69,26 @@ jobs:
             # banner to find, so this line is information rather than a gate.
             strings -a "$f" | grep -icE 'musl|BIONIC' | sed 's/^/libc marker lines: /' ||
               echo 'libc marker lines: 0'
+          done
+
+      - name: Gate on the two things that broke before
+        run: |
+          set -euo pipefail
+          for f in fbprint-musl fbprint-glibc; do
+            # An x86_64 fbprint builds and runs happily on the runner, so the only way
+            # to catch it is to ask the binary which machine it claims.
+            if ! readelf -h "$f" | grep -q 'Machine:.*AArch64'; then
+              echo "FAIL $f is not an AArch64 binary"
+              readelf -h "$f" | grep 'Machine:'
+              exit 1
+            fi
+            # Bionic's loader refuses a static executable whose TLS aligns under 64,
+            # so a Linux ABI is the other thing that has to be true to run at all.
+            if readelf -h "$f" | grep -q 'OS/ABI:.*ANDROID'; then
+              echo "FAIL $f is an Android binary and will abort before main"
+              exit 1
+            fi
+            echo "OK $f: AArch64, $(readelf -h "$f" | sed -n 's|^ *OS/ABI: *||p')"
           done
 
       - uses: actions/upload-artifact@v4
