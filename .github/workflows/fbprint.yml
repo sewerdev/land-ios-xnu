@@ -2,17 +2,17 @@ name: fbprint
 
 # Build the panel painter for land as a Linux aarch64 binary.
 #
-# The first fbprint was built with the Android NDK, and it has never once drawn
-# anything: bionic's startup refuses to load a static executable whose TLS segment is
-# aligned to less than 64 bytes, clang emits 8, so the process dies with SIGABRT
-# before main.  The boot probe calls it with its output swallowed, so the failure
-# showed up as nothing more than the Xiaomi logo staying on the screen.  A glibc
-# static build does not make that demand, and gcc-aarch64-linux-gnu is in Ubuntu's
-# archive, so this is the only job that can produce a binary that runs.
+# The first fbprint was built with the Android NDK, and it never ran once: bionic
+# refuses to start a static executable whose TLS segment is aligned under 64 bytes on
+# arm64, clang emits 8, so /bin/fbprint died of SIGABRT before main.  The boot probe
+# calls it with its output swallowed, so the only symptom was the Xiaomi logo staying
+# on the screen.
 #
-# It is a separate workflow rather than a step of eos-rootfs because the boot image
-# needs it and the root does not, and because a boot probe fix should not wait on a
-# six-minute pacman run.
+# Two Linux toolchains are built here because they are not equally safe on a 4.19
+# kernel.  The initramfs already carries Alpine's musl busybox and it runs on the
+# phone, so the musl static build is the one that gets packed; the glibc cross build
+# is kept next to it as a second opinion, and both report the ELF fields that killed
+# the NDK build so a future toolchain change cannot quietly bring them back.
 
 on:
   workflow_dispatch:
@@ -31,29 +31,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the cross compiler
+      - name: Enable arm64 emulation
+        run: docker run --privileged --rm tonistiigi/binfmt --install arm64
+
+      - name: Build musl static inside a real aarch64 container
         run: |
+          set -euo pipefail
+          # linux-headers is where <linux/fb.h> lives, and without it fbprint falls
+          # back to its own copy of the structs rather than the kernel's.
+          docker run --rm -v "$GITHUB_WORKSPACE":/work alpine:3.20 sh -c '
+            apk add --no-cache gcc musl-dev linux-headers >/dev/null &&
+            aarch64-alpine-linux-musl-gcc -O2 -static -Wall -Wextra \
+              -I /work/probe -o /work/fbprint-musl /work/probe/fbprint.c &&
+            ls -l /work/fbprint-musl'
+
+      - name: Build glibc static with the Debian cross compiler
+        run: |
+          set -euo pipefail
           sudo apt-get update
-          # gcc-aarch64-linux-gnu pulls libc6-dev-arm64-cross with it, and that is
-          # where the aarch64 build finds linux/fb.h.
+          # gcc-aarch64-linux-gnu pulls libc6-dev-arm64-cross, which is where this
+          # build finds its own linux/fb.h.
           sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build
-        run: |
           aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra \
-            -I probe -o fbprint probe/fbprint.c
-          file fbprint
+            -I probe -o fbprint-glibc probe/fbprint.c
+          file fbprint-glibc
 
-      - name: Report what the loader will be asked to accept
+      - name: Report what a loader will be asked to accept
         run: |
-          # The exact check that killed the NDK build, printed here so a future
-          # toolchain change cannot silently bring it back.
-          aarch64-linux-gnu-readelf -h fbprint | grep -E 'Class|Machine|OS ABI'
-          aarch64-linux-gnu-readelf -lW fbprint | grep -E 'Type|TLS|INTERP' ||
-            echo 'no TLS segment'
-          ls -l fbprint
+          set -euo pipefail
+          for f in fbprint-musl fbprint-glibc; do
+            echo "=== $f"
+            readelf -h "$f" | grep -E 'Class:|Machine:|OS/ABI'
+            readelf -lW "$f" | grep -E 'Type|TLS|INTERP' || echo 'no TLS segment, no interpreter'
+            strings -a "$f" | grep -icE 'musl|BIONIC' | sed 's/^/libc marker lines: /'
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: fbprint-aarch64
-          path: fbprint
+          path: |
+            fbprint-musl
+            fbprint-glibc
