@@ -14,6 +14,24 @@ set -euo pipefail
 
 ROOT=/work/rootfs
 
+# The runner creates this directory as uid 1001 and the container installs into
+# it as root, which makes every path under it "owned by 1001" to systemd's
+# canonicalizer and leaves the tree unreadable to the unprivileged du that runs
+# after this script.
+mkdir -p "$ROOT"
+chown 0:0 "$ROOT"
+chmod 755 "$ROOT"
+
+# pacman --root changes where packages land but not which config file is read:
+# without --config it keeps using the container's own /etc/pacman.conf, so a
+# repository appended to the root's copy is simply not there when it
+# synchronizes.  That is exactly what happened on the last run, where the sync
+# listed core, extra, alarm and aur and then every EndeavourOS package came back
+# "target not found".
+pm() {
+  pacman -r "$ROOT" --config "$ROOT/etc/pacman.conf" "$@"
+}
+
 # The whole EndeavourOS ARM repository, package files and .db included, is
 # served from this tree.  mirror.endeavouros.info does not resolve and the tree
 # has no endeavouros.db.sig, so the tree URL is the server and the repository
@@ -39,7 +57,6 @@ pacman-key --init
 pacman-key --populate archlinuxarm
 pacman -Sy --noconfirm arch-install-scripts >/dev/null
 
-mkdir -p "$ROOT"
 # -K initializes the target's package database and copies the host keyring in,
 # -c keeps the downloaded packages in the target cache so the on-device pacman
 # has something to work from.  base is bash, coreutils, filesystem, pacman,
@@ -52,7 +69,7 @@ grep -q '^DisableSandbox' "$ROOT/etc/pacman.conf" ||
 # carries the kernel that will actually run, so a kernel in the root would only
 # be a claim about something that is not there.
 for k in linux linux-aarch64 linux-ck linux-eos-arm; do
-  pacman -r "$ROOT" -Rns --noconfirm "$k" >/dev/null 2>&1 || true
+  pm -Rns --noconfirm "$k" >/dev/null 2>&1 || true
 done
 
 if [ "${EOS:-0}" = 1 ]; then
@@ -62,7 +79,7 @@ if [ "${EOS:-0}" = 1 ]; then
   cp "$ROOT/etc/pacman.conf" /tmp/pacman.conf.orig
   printf '\n[endeavouros]\nSigLevel = Optional TrustAll\nServer = %s\n' "$EOSREPO" \
     >> "$ROOT/etc/pacman.conf"
-  pacman -r "$ROOT" -Sy --noconfirm
+  pm -Sy --noconfirm
   # One package per transaction, in dependency order.  A single -S of the whole
   # list is all-or-nothing, and eos-base and eos-settings do not exist for
   # aarch64 at all, so that command would fail and take the layer with it.
@@ -70,7 +87,7 @@ if [ "${EOS:-0}" = 1 ]; then
   for p in endeavouros-keyring endeavouros-mirrorlist endeavouros-branding \
            eos-bash-shared eos-apps-info eos-log-tool eos-rankmirrors \
            eos-update eos-reboot-recommended yay paru; do
-    if pacman -r "$ROOT" -S --noconfirm "$p"; then
+    if pm -S --noconfirm "$p"; then
       echo "eos layer: $p ok"
     else
       echo "eos layer: $p failed"
@@ -85,7 +102,7 @@ fi
 if [ "${DESKTOP:-0}" = 1 ]; then
   # There is no Adreno 308 driver anywhere, so the desktop is X over fbdev plus
   # llvmpipe, on the same framebuffer the kernel console already uses.
-  pacman -r "$ROOT" -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa \
+  pm -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa \
     xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
   systemctl --root "$ROOT" enable lightdm
 fi
@@ -104,5 +121,5 @@ printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclea
 # init, not a newer kernel.
 echo "root built: $(du -sh "$ROOT" | cut -f1)"
 echo "eos packages in the root:"
-pacman -r "$ROOT" -Q | grep -iE 'endeavouros|^eos|^yay|^paru' || echo "  none"
+pm -Q | grep -iE 'endeavouros|^eos|^yay|^paru' || echo "  none"
 ls "$ROOT"
