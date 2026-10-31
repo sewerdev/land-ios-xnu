@@ -1,17 +1,20 @@
 name: eos-rootfs
 
-# Build an aarch64 root for land (Redmi 3S) out of Arch Linux ARM, in the shape
-# EndeavourOS uses: an Arch base, the EndeavourOS layer on top when its repo
-# answers for aarch64, packed as an ext4 image.  Nothing here needs a macOS
-# runner, and no kernel is built: mkbootcmd.py writes the matching cmdline into
-# the LineageOS 18 boot image, which already carries Linux 4.19.325-Mi8937v2 for
-# this board, and the phone mounts this root with root=/dev/mmcblk0p49.
+# Build an EndeavourOS root for land (Redmi 3S): an Arch Linux ARM base with the
+# EndeavourOS repository, keyring, branding and tooling on top, packed as an ext4
+# image that the phone mounts as /dev/mmcblk0p49 (userdata).
 #
-# The root is assembled inside an arm64 container.  A chroot with qemu-user was
-# tried first and every pacman -Sy died with "Could not resolve host" even with
-# nameserver 1.1.1.1 in the guest's resolv.conf and --disable-sandbox, while the
-# same download from the runner host works: Docker gives the guest its own
-# resolver instead of relying on the host's.
+# No kernel is built or needed here: mkbootcmd.py writes the cmdline into the
+# LineageOS 18 boot image, which already carries Linux 4.19.325-Mi8937v2 plus the
+# phone's own DTB, and that kernel mounts this root.
+#
+# The root is assembled inside a container imported from the Arch Linux ARM
+# tarball.  Two things were tried before this and both are recorded because they
+# cost runs: gh's own artifact download stalls on multi-gigabyte zips, and a bare
+# chroot of that tarball could not resolve any name (its nsswitch asks
+# systemd-resolve, which does not exist in a chroot).  Docker gives the guest its
+# own resolver, and the container has no architecture claim to fight with the
+# host, so binfmt is what makes pacman inside it the real arm64 binary.
 
 on:
   workflow_dispatch:
@@ -42,26 +45,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Enable arm64 emulation
+      - name: Enable arm64 emulation and import the ALARM base
         run: |
           set -euo pipefail
-          # fix-binary binfmt is what lets the x86_64 kernel exec aarch64 ELF, so
-          # the container runs the real pacman rather than a cross wrapper.
+          # fix-binary binfmt lets the x86_64 kernel exec aarch64 ELF, so the
+          # container runs the real pacman instead of a cross wrapper.
           docker run --privileged --rm tonistiigi/binfmt --install arm64
-          docker version --format '{{.Server.Version}}'
+          curl -sSL -o alarm.tar.gz http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+          ls -l alarm.tar.gz
+          docker import --change 'CMD ["/bin/bash"]' alarm.tar.gz alarm-aarch64:local
+          docker images alarm-aarch64
 
-      - name: Build the root inside an Arch Linux ARM container
+      - name: Build the root inside the container
         env:
           DESKTOP: ${{ inputs.desktop && '1' || '0' }}
           EOS: ${{ inputs.endeavouros && '1' || '0' }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/rootfs"
-          docker pull --platform linux/arm64 archlinuxarm/archlinux-aarch64-image
-          docker run --rm --platform linux/arm64 -e DESKTOP -e EOS \
+          docker run --rm -e DESKTOP -e EOS \
             -v "$RUNNER_TEMP/rootfs":/work/rootfs \
             -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
-            archlinuxarm/archlinux-aarch64-image bash -e /work/eos/pack.sh
+            alarm-aarch64:local bash -e /work/eos/pack.sh
           du -sh "$RUNNER_TEMP/rootfs"
           sudo ls "$RUNNER_TEMP/rootfs"
 
