@@ -12,68 +12,80 @@
 # again below.
 set -euo pipefail
 
-# --disable-sandbox on every transaction: pacman 6 drops to the alpm user
-# through Landlock, and qemu-user does not implement the landlock syscalls, so
-# inside an arm64 container on an x86_64 host pacman always sees "Landlock is not
-# supported by the kernel" and refuses to run at all.  Docker seccomp settings do
-# not matter here, the syscall never reaches the kernel.
-
 ROOT=/work/rootfs
+
+# The whole EndeavourOS ARM repository, package files and .db included, is
+# served from this tree.  mirror.endeavouros.info does not resolve and the tree
+# has no endeavouros.db.sig, so the tree URL is the server and the repository
+# cannot ask for a required database signature.
 EOSREPO=${EOSREPO:-https://raw.githubusercontent.com/endeavouros-team/repo/master/endeavouros/aarch64}
 
-# The imported tarball has no initialised keyring: without this the first
-# transaction dies with "keyring is not writable" / "required key missing".
-pacman-key --init
-pacman-key --populate archlinuxarm 2>/dev/null || true
+# Landlock is what actually stops pacman here, twice over, and it is not a
+# Docker seccomp problem: qemu-user does not implement the landlock syscalls, so
+# pacman inside the arm64 container sees "Landlock is not supported by the
+# kernel" on the very first transaction.  The same is true on the phone, whose
+# 4.19 kernel predates Landlock (5.13) entirely, so the option goes into the
+# config of both the container and the root and stays there.  It is written into
+# /etc/pacman.conf rather than passed as --disable-sandbox because pacstrap
+# parses its own argv with getopts and dies on an unknown long option: the run
+# before this one ended with "pacstrap: invalid option -- 'd'".
+for conf in /etc/pacman.conf; do
+  grep -q '^DisableSandbox' "$conf" || sed -i '/^\[options\]/a DisableSandbox' "$conf"
+done
 
-pacman -Sy --noconfirm --disable-sandbox arch-install-scripts >/dev/null
+# The imported tarball has no initialised keyring, so this comes before the
+# first transaction that has to verify a signature.
+pacman-key --init
+pacman-key --populate archlinuxarm
+pacman -Sy --noconfirm arch-install-scripts >/dev/null
 
 mkdir -p "$ROOT"
-# -K no free-space check, -c no downgrades, -d do not treat the repo's kernel as
-# a dependency to satisfy.  base is bash, coreutils, filesystem, pacman,
+# -K initializes the target's package database and copies the host keyring in,
+# -c keeps the downloaded packages in the target cache so the on-device pacman
+# has something to work from.  base is bash, coreutils, filesystem, pacman,
 # systemd, util-linux.
-pacstrap -Kcd --disable-sandbox "$ROOT" base
+pacstrap -Kc "$ROOT" base
+grep -q '^DisableSandbox' "$ROOT/etc/pacman.conf" ||
+  sed -i '/^\[options\]/a DisableSandbox' "$ROOT/etc/pacman.conf"
 
 # The ALARM image kernel is for a different board and the LOS boot image already
 # carries the kernel that will actually run, so a kernel in the root would only
 # be a claim about something that is not there.
-for k in linux linux-aarch64 linux-ck; do
-  pacman -r "$ROOT" -Rns --noconfirm --disable-sandbox "$k" >/dev/null 2>&1 || true
+for k in linux linux-aarch64 linux-ck linux-eos-arm; do
+  pacman -r "$ROOT" -Rns --noconfirm "$k" >/dev/null 2>&1 || true
 done
 
 if [ "${EOS:-0}" = 1 ]; then
-  # The EndeavourOS layer proper: their keyring, their mirrorlist, their
-  # branding and tooling.  Backed up before touching pacman.conf, because a
-  # [endeavouros] header that no mirror answers makes every later pacman -S fail
-  # as well, -S synchronizes all repositories at once.
+  # The EndeavourOS layer proper.  Backed up before touching pacman.conf: a
+  # repository line that nothing answers makes every later transaction fail,
+  # because -S synchronizes all repositories at once.
   cp "$ROOT/etc/pacman.conf" /tmp/pacman.conf.orig
+  printf '\n[endeavouros]\nSigLevel = Optional TrustAll\nServer = %s\n' "$EOSREPO" \
+    >> "$ROOT/etc/pacman.conf"
+  pacman -r "$ROOT" -Sy --noconfirm
+  # One package per transaction, in dependency order.  A single -S of the whole
+  # list is all-or-nothing, and eos-base and eos-settings do not exist for
+  # aarch64 at all, so that command would fail and take the layer with it.
   rc=0
-  {
-    printf '\n[endeavouros]\nSigLevel = Optional TrustAll\nServer = %s\n' "$EOSREPO" \
-      >> "$ROOT/etc/pacman.conf"
-    pacman -r "$ROOT" -Sy --noconfirm --disable-sandbox
-    # Optional TrustAll, not PackageRequired: the .sig files in that tree are
-    # made by the endeavouros key, and pulling the real keyring is the next
-    # line, so the very first transaction has to be allowed to go unverified.
-    pacman -r "$ROOT" -S --noconfirm --disable-sandbox endeavouros-keyring endeavouros-mirrorlist \
-      endeavouros-branding eos-settings eos-base eos-bash-shared || true
-    # Now trust the repo the way EndeavourOS does, for the packages installed
-    # later on the phone.
-    sed -i '/^\[endeavouros\]/,/^\[/{s/^SigLevel = .*/SigLevel = PackageRequired/}' "$ROOT/etc/pacman.conf"
-    server=$(printf 'https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch')
-    sed -i "/^Server = $(printf '%s' "$EOSREPO" | sed 's/[&/\]/\\&/g')/c\\Server = $server" "$ROOT/etc/pacman.conf"
-    pacman -r "$ROOT" -Sy --noconfirm --disable-sandbox
-  } || rc=$?
+  for p in endeavouros-keyring endeavouros-mirrorlist endeavouros-branding \
+           eos-bash-shared eos-apps-info eos-log-tool eos-rankmirrors \
+           eos-update eos-reboot-recommended yay paru; do
+    if pacman -r "$ROOT" -S --noconfirm "$p"; then
+      echo "eos layer: $p ok"
+    else
+      echo "eos layer: $p failed"
+      rc=1
+    fi
+  done
   if [ "$rc" != 0 ]; then
-    echo "endeavouros layer failed (rc=$rc), keeping the plain Arch root"
-    cp /tmp/pacman.conf.orig "$ROOT/etc/pacman.conf"
+    echo "endeavouros layer incomplete, keeping what landed"
   fi
 fi
 
 if [ "${DESKTOP:-0}" = 1 ]; then
   # There is no Adreno 308 driver anywhere, so the desktop is X over fbdev plus
   # llvmpipe, on the same framebuffer the kernel console already uses.
-  pacman -r "$ROOT" -S --noconfirm --disable-sandbox xorg-server xorg-xinit xf86-video-fbdev mesa \
+  pacman -r "$ROOT" -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa \
     xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
   systemctl --root "$ROOT" enable lightdm
 fi
@@ -82,7 +94,8 @@ fi
 # are the difference between a session and a brick, and are not a security
 # boundary in any case.
 sed -i 's/^root:[^:]*/root::/' "$ROOT/etc/shadow"
-mkdir -p "$ROOT/etc/systemd/system/getty@tty1.service.d"
+mkdir -p "$ROOT/etc/systemd/system/getty@tty1.service.d" \
+         "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp"
 printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear tty1 linux\n' \
   > "$ROOT/etc/systemd/system/getty@tty1.service.d/autologin.conf"
 
@@ -90,4 +103,6 @@ printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclea
 # boot uses init=/bin/sh.  If systemd refuses to start, the answer is an older
 # init, not a newer kernel.
 echo "root built: $(du -sh "$ROOT" | cut -f1)"
+echo "eos packages in the root:"
+pacman -r "$ROOT" -Q | grep -iE 'endeavouros|^eos|^yay|^paru' || echo "  none"
 ls "$ROOT"
