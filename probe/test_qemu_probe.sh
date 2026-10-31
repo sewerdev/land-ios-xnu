@@ -28,6 +28,30 @@ note() { echo "$*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
 good() { echo "PASS $*"; }
 
+# A deadline that actually works, and a wait that actually ends.  `timeout N qemu.exe`
+# kills the bash job and leaves the Windows process running, so a guest that reached
+# its targets and simply stayed there hung the whole suite forever.  Feeding Ctrl-A x
+# to the -nographic monitor makes qemu quit by itself, but then the shell has to wait
+# for its own sleeper before the pipeline closes, which would make every scenario cost
+# its full deadline even when the guest powered off in a minute.  runqemu.ps1 starts the
+# process, waits on it and kills it at the deadline, and reads its arguments from a file
+# because quoting them through a PowerShell -Command string lost the child exit code.
+runqemu() { # runqemu <seconds> <logfile> <qemu args...>
+	local secs=$1 log=$2
+	shift 2
+	local a rc
+	: >"$D/$log.args"
+	for a in "$@"; do
+		printf '%s\n' "$a" >>"$D/$log.args"
+	done
+	powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$D/runqemu.ps1")" \
+		-Exe "$(cygpath -w "$QEMU")" -ArgsFile "$(cygpath -w "$D/$log.args")" \
+		-Ms "$((secs * 1000))" >"$D/$log" 2>&1
+	rc=$?
+	rm -f "$D/$log.args"
+	return "$rc"
+}
+
 [ -x "$QEMU" ] || { echo "NO-QEMU $QEMU"; exit 2; }
 [ -f "$KERNEL" ] || { echo "NO-KERNEL $KERNEL: unpack linux-virt.apk into work/apk first"; exit 2; }
 IMG=$(cygpath -w "$IMG")
@@ -51,12 +75,12 @@ dd if=/dev/zero of=cache.img bs=1M count=64 2>/dev/null
 "/cygdrive/c/Program Files/platform-tools/mke2fs.exe" -F -q -L landcache cache.img 2>/dev/null
 
 note "booting the probe under qemu"
-timeout 600 "$QEMU" -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
+runqemu 600 qemu-console.log -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
 	-kernel "$KERNEL" -initrd qemu-initrd.cpio.gz \
 	-append "console=ttyAMA0 landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc landnoreboot" \
 	-drive file="$IMG",if=virtio,snapshot=on \
 	-drive file=cache.img,if=virtio \
-	-drive file=dip.bin,if=virtio >qemu-console.log 2>&1
+	-drive file=dip.bin,if=virtio
 rc=$?
 [ "$rc" = 0 ] || [ "$rc" = 124 ] || bad "qemu exited $rc"
 grep -q "reboot: Power down" qemu-console.log && good "probe reached the end and powered off" ||
@@ -98,13 +122,13 @@ rm -f dip.bin cache.img
 dd if=/dev/zero of=dip.bin bs=1M count=1 2>/dev/null
 dd if=/dev/zero of=cache.img bs=1M count=64 2>/dev/null
 "/cygdrive/c/Program Files/platform-tools/mke2fs.exe" -F -q -L landcache cache.img 2>/dev/null
-timeout 900 "$QEMU" -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
+runqemu 1300 qemu-pkgtest.log -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
 	-kernel "$KERNEL" -initrd qemu-initrd.cpio.gz \
 	-append "console=ttyAMA0 landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc landnoreboot landpkgtest" \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	-drive file="$IMG",if=virtio,snapshot=on \
 	-drive file=cache.img,if=virtio \
-	-drive file=dip.bin,if=virtio >qemu-pkgtest.log 2>&1
+	-drive file=dip.bin,if=virtio
 rc=$?
 [ "$rc" = 0 ] || [ "$rc" = 124 ] || bad "pkg test qemu exited $rc"
 
@@ -154,13 +178,13 @@ rm -f dip.bin cache.img
 dd if=/dev/zero of=dip.bin bs=1M count=1 2>/dev/null
 dd if=/dev/zero of=cache.img bs=1M count=64 2>/dev/null
 "/cygdrive/c/Program Files/platform-tools/mke2fs.exe" -F -q -L landcache cache.img 2>/dev/null
-timeout 240 "$QEMU" -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
+runqemu 240 qemu-systemd.log -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
 	-kernel "$KERNEL" -initrd qemu-initrd.cpio.gz \
 	-append "console=ttyAMA0 landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc landsystemd" \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 	-drive file="$IMG",if=virtio,snapshot=on \
 	-drive file=cache.img,if=virtio \
-	-drive file=dip.bin,if=virtio >qemu-systemd.log 2>&1
+	-drive file=dip.bin,if=virtio
 
 grep -q "handing the phone to systemd" qemu-systemd.log &&
 	good "the probe handed the root over" || bad "the probe never handed over"
@@ -179,12 +203,13 @@ rm -f dip.bin cache.img
 dd if=/dev/zero of=dip.bin bs=1M count=1 2>/dev/null
 dd if=/dev/zero of=cache.img bs=1M count=64 2>/dev/null
 "/cygdrive/c/Program Files/platform-tools/mke2fs.exe" -F -q -L landcache cache.img 2>/dev/null
-timeout 240 "$QEMU" -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
+runqemu 240 qemu-init.log -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
 	-kernel "$KERNEL" -initrd qemu-initrd.cpio.gz \
 	-append "console=ttyAMA0 landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc landinit" \
+	-device virtio-gpu-pci \
 	-drive file="$IMG",if=virtio,snapshot=on \
 	-drive file=cache.img,if=virtio \
-	-drive file=dip.bin,if=virtio >qemu-init.log 2>&1
+	-drive file=dip.bin,if=virtio
 if grep -q "LANDINIT" qemu-init.log; then
 	good "landinit.sh became pid 1 and reported itself"
 	grep -E "LANDINIT" qemu-init.log | head -3 | sed 's/^/  /'
@@ -199,12 +224,41 @@ fi
 import sys
 d = open(sys.argv[1], 'rb').read()
 rec = d[200 * 512:200 * 512 + 512].split(b'\0')[0].decode('utf8', 'replace')
-if rec.startswith('LANDINIT up'):
-	print('PASS the root reported to the journal by itself: %s' % rec)
-	sys.exit(0)
-print('FAIL no landinit journal record (got %r)' % rec[:60])
-sys.exit(1)
+if not rec.startswith('LANDINIT up'):
+	print('FAIL no landinit journal record (got %r)' % rec[:60])
+	sys.exit(1)
+print('PASS the root reported to the journal by itself: %s' % rec)
+sys.exit(0 if 'panel=ok' in rec else 2)
 PY
-[ $? = 0 ] || fails=$((fails + 1))
+rc=$?
+[ $rc = 0 ] && good "the root painted its own status onto a real framebuffer"
+[ $rc = 2 ] && { bad "landinit ran but the panel did not take the drawing"; fails=$((fails + 1)); }
+[ $rc = 1 ] && fails=$((fails + 1))
+
+# The one guard that keeps a broken userdata from rebooting the phone forever is read
+# out of the raw journal, so it can be tested by writing the journal by hand: a start
+# record with no matching handback is exactly what a hung boot leaves behind.
+note "booting again with a hung attempt already in the journal"
+rm -f dip.bin cache.img
+dd if=/dev/zero of=dip.bin bs=1M count=1 2>/dev/null
+dd if=/dev/zero of=cache.img bs=1M count=64 2>/dev/null
+"/cygdrive/c/Program Files/platform-tools/mke2fs.exe" -F -q -L landcache cache.img 2>/dev/null
+printf 'LANDPROBE-START n=3 cache=none nodes=vda vdb vdc\n' >work-rec5
+dd if=work-rec5 of=dip.bin bs=512 count=1 seek=5 conv=notrunc 2>/dev/null
+rm -f work-rec5
+runqemu 240 qemu-stuck.log -machine virt -cpu cortex-a57 -smp 2 -m 2048 -nographic -no-reboot \
+	-kernel "$KERNEL" -initrd qemu-initrd.cpio.gz \
+	-append "console=ttyAMA0 landroot=/dev/vda landcache=/dev/vdb landjournal=/dev/vdc" \
+	-drive file="$IMG",if=virtio,snapshot=on \
+	-drive file=cache.img,if=virtio \
+	-drive file=dip.bin,if=virtio
+grep -q "never reached its handback, refusing to reboot again" qemu-stuck.log &&
+	good "the journal guard noticed the hung attempt" ||
+	bad "the guard did not read the journal: a hung board would reboot forever"
+grep -qE "powering off for a human|reboot: Power down" qemu-stuck.log &&
+	good "a stuck board powers off instead of looping" ||
+	bad "the stuck path did not power off"
+grep -q "handing the phone" qemu-stuck.log &&
+	bad "a stuck probe still tried a handover" || good "a stuck probe never handed over"
 echo "TEST-QEMU-PROBE $([ $fails = 0 ] && echo ALL-OK || echo "FAILS=$fails")"
 exit "$fails"
