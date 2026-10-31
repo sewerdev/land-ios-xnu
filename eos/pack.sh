@@ -97,6 +97,31 @@ if [ "${EOS:-0}" = 1 ]; then
   if [ "$rc" != 0 ]; then
     echo "endeavouros layer incomplete, keeping what landed"
   fi
+  if [ -f "$ROOT/usr/share/pacman/keyrings/endeavouros.gpg" ]; then
+    # Trust the EndeavourOS signing key inside the root, so a pacman run on the
+    # phone verifies these packages instead of being told to trust everything.
+    arch-chroot "$ROOT" pacman-key --populate endeavouros ||
+      echo "could not populate the endeavouros keyring in the root"
+    sed -i '/^\[endeavouros\]/,/^\[/{s/^SigLevel = .*/SigLevel = Optional/}' \
+      "$ROOT/etc/pacman.conf"
+    # Nothing in the aarch64 repository provides /etc/os-release: on x86_64 that
+    # is eos-base, and eos-base was never built for arm.  A root that came out of
+    # this build with the EndeavourOS repository, keyring and tooling in it should
+    # say so, and the boot probe reads this file to report what it found.
+    cat >"$ROOT/etc/os-release" <<'OSR'
+NAME="EndeavourOS ARM"
+VERSION="rolling"
+ID=endeavouros
+ID_LIKE="arch arm"
+PRETTY_NAME="EndeavourOS ARM (land)"
+HOME_URL="https://endeavouros.com"
+SUPPORT_URL="https://forum.endeavouros.com"
+BUG_REPORT_URL="https://github.com/endeavouros-team/repo/issues"
+ARCH_DIST_INFO=rolling
+OSR
+    ln -sf ../usr/share/endeavouros/endeavouros-logo.svg \
+      "$ROOT/usr/share/pixmaps/endeavouros-logo.svg" 2>/dev/null || true
+  fi
 fi
 
 if [ "${DESKTOP:-0}" = 1 ]; then
