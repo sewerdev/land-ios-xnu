@@ -21,9 +21,12 @@ OUT=/dev/console
 say() {
 	echo "$*" >"$OUT" 2>/dev/null
 	# The framebuffer is the only thing on this board that can show a word: the
-	# kernel has no VT and no fbcon, so every line has to be redrawn as pixels.
+	# kernel has no VT and no fbcon, so every line has to be redrawn as pixels.  Only
+	# the tail fits: three times an 8x16 cell is 48 pixels a row, so a 480 line panel
+	# shows ten of them, and a journal drawn from the top would stop showing the
+	# verdict as soon as the first ten lines were preamble.
 	printf '%s\n' "$*" >>"$SCR" 2>/dev/null
-	fbprint --scale 3 <"$SCR" 2>/dev/null
+	tail -10 "$SCR" 2>/dev/null | fbprint --scale 3 2>/dev/null
 }
 
 # Where to keep the scratch files.  The phone's initramfs has a plain /tmp, but the
@@ -92,7 +95,10 @@ for a in $(cat /proc/cmdline 2>/dev/null); do
 	landcache=*) CACHEDEV=${a#landcache=} ;;
 	landjournal=*) JOURNALDEV=${a#landjournal=} ;;
 	landnoreboot) NOREBOOT=1 ;;
-	landpkgtest) PKGTEST=1; WATCHDOG=900 ;;
+	# A package test is sync plus install plus the check that the installed binary
+	# runs, and under an emulated cpu the install alone measured 600 seconds.  The
+	# timer has to outlast the whole block or the phone powers off mid-test.
+	landpkgtest) PKGTEST=1; WATCHDOG=1500 ;;
 	landsystemd) TRY_SYSTEMD=1 ;;
 	landinit) TRY_INIT=1 ;;
 	esac
@@ -367,7 +373,7 @@ if [ "$PKGTEST" = 1 ] && [ "$ROK" = 1 ]; then
 		cp /etc/resolv.conf /mnt/r/etc/resolv.conf 2>/dev/null
 		ifconfig 2>/dev/null | head -12
 		chroot /mnt/r /bin/sh -c 'head -3 /etc/resolv.conf; timeout 300 pacman -Sy --noconfirm 2>&1 | tail -8'
-		chroot /mnt/r /bin/sh -c 'timeout 300 pacman -S --noconfirm --needed --disable-download-timeout tree 2>&1 | tail -14'
+		chroot /mnt/r /bin/sh -c 'timeout 600 pacman -S --noconfirm --needed --disable-download-timeout tree 2>&1 | tail -14'
 		chroot /mnt/r /bin/sh -c 'echo "tree-record: $(pacman -Q tree)"; echo "tree-version: $(tree --version 2>&1)"'
 	} >>"$LOG" 2>&1
 	sync
@@ -400,6 +406,12 @@ fi
 # inside systemd leaves no pid 1 to write the journal and no handback, so systemd
 # only gets tried once the mount itself has been read from the PC side.
 handover() { # move the API filesystems into the new root and get out of the way
+	# A handover is a finished boot: the probe did what it was for and the root takes
+	# over from here.  Saying so in the journal matters because the next boot decides
+	# whether to trust this board again by comparing that record against its own start
+	# marker, and a missing handback is read as a hang.
+	printf 'LANDPROBE-HB n=%s mode=handover\n' "$N" |
+		dd of="$JOURNALDEV" bs=512 count=1 seek=3 conv=notrunc 2>/dev/null
 	# The sysrq timer above survives the exec, because switch_root only replaces this
 	# process and the new pid 1 inherits the orphan.  Left running, it would power the
 	# phone off in the middle of a distro that is working, so the handover cancels it
