@@ -138,6 +138,32 @@ for x in $EXTRA; do
   fi
 done
 
+# PID 1 for this root on land's stock kernel.  That kernel has no CONFIG_FHANDLE,
+# no cgroup device or pids controller, no POSIX mqueue and no autofs, and systemd
+# refuses to run without name_to_handle_at, so on this board systemd can be
+# installed and used for its tools but it cannot be init.  This script is what the
+# boot probe hands the phone over to instead: it brings up the filesystems an
+# Arch userland expects, keeps a shell on the console, and starts adbd if the
+# initramfs left the gadget for it to claim.
+cat >"$ROOT/landinit.sh" <<'LANDINIT'
+#!/bin/sh
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t tmpfs tmpfs /run 2>/dev/null
+mount -t tmpfs shm /dev/shm 2>/dev/null
+mount -t configfs configfs /sys/kernel/config 2>/dev/null
+[ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
+. /etc/os-release 2>/dev/null
+echo "LANDINIT ${PRETTY_NAME:-EndeavourOS} up, kernel $(uname -r)" >/dev/console
+echo "LANDINIT packages: $(pacman -Q 2>/dev/null | wc -l)" >/dev/console
+while :; do
+	/bin/sh </dev/console >/dev/console 2>&1
+	sleep 5
+done
+LANDINIT
+chmod 755 "$ROOT/landinit.sh"
+
 if [ "${DESKTOP:-0}" = 1 ]; then
   # There is no Adreno 308 driver anywhere, so the desktop is X over fbdev plus
   # llvmpipe, on the same framebuffer the kernel console already uses.
