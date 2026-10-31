@@ -156,15 +156,28 @@ mount -t sysfs sysfs /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs shm /dev/shm 2>/dev/null
 [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
+# There is no framebuffer console in this kernel, so the panel only shows what a
+# program paints on /dev/fb0.  The boot probe copies its fbprint here.
+SCR=/run/landinit-screen
+draw() {
+	printf '%s\n' "$@" >"$SCR" 2>/dev/null
+	if [ -e /dev/fb0 ] && [ -x /usr/local/bin/fbprint ]; then
+		/usr/local/bin/fbprint --scale 3 <"$SCR" >/dev/null 2>&1
+	fi
+}
 . /etc/os-release 2>/dev/null
+PKGS=$(pacman -Q 2>/dev/null | wc -l)
 echo "LANDINIT ${PRETTY_NAME:-EndeavourOS} up, kernel $(uname -r)" >/dev/console 2>&1
-echo "LANDINIT packages: $(pacman -Q 2>/dev/null | wc -l)" >/dev/console 2>&1
+echo "LANDINIT packages: $PKGS" >/dev/console 2>&1
+draw "EndeavourOS on land" "kernel $(uname -r)" "packages: $PKGS"
 if [ -e /root/land-stay ]; then
 	echo "LANDINIT /root/land-stay present, no automatic return to recovery" >/dev/console 2>&1
+	draw "staying up: /root/land-stay"
 else
 	(
 		sleep 900
 		echo recovery >/sys/reboot/cmd 2>/dev/null
+		draw "back to recovery"
 		reboot -f
 	) &
 	echo "LANDINIT returning to recovery in 15 minutes" >/dev/console 2>&1
