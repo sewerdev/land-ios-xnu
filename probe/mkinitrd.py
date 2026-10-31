@@ -26,6 +26,7 @@ BIN_LINKS = [
     'mkdir', 'mount', 'od', 'rm', 'sed', 'sleep', 'stat', 'sync', 'tail',
     'tr', 'uname', 'wc', 'cp', 'mv', 'date', 'pidof', 'kill', 'true', 'false',
     'dmesg', 'mknod', 'readlink', 'basename', 'dirname', 'du', 'find', 'printf',
+    'timeout',
 ]
 SBIN_LINKS = [
     'reboot', 'poweroff', 'halt', 'switch_root', 'pivot_root', 'umount', 'fsck',
