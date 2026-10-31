@@ -75,11 +75,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
+          # pacman 6 drops privileges to the alpm user through Landlock, and under
+          # qemu-user inside a chroot the syscall is not available: without this flag the
+          # very first -Sy dies with "switching to sandbox user 'alpm' failed".
           # ALARM signs with its own key; the tarball's keyring is old enough that a
           # -Syu without a keyring refresh fails on the very first transaction.
-          pacman -Sy --noconfirm archlinux-archive-keyring archlinuxarm-keyring
+          pacman -Sy --noconfirm --disable-sandbox archlinux-archive-keyring archlinuxarm-keyring
           pacman-key --populate archlinux archlinuxarm
-          pacman -Syu --noconfirm
+          pacman -Syu --noconfirm --disable-sandbox
           EOS
 
       - name: Add the EndeavourOS layer
@@ -91,8 +94,8 @@ jobs:
             printf '\n[endeavouros]\nSigLevel = PackageRequired\nServer = https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch\n' \
               >> /etc/pacman.conf
           fi
-          pacman -Sy --noconfirm
-          pacman -S --noconfirm endeavouros-mirrorlist eos-base || \
+          pacman -Sy --noconfirm --disable-sandbox
+          pacman -S --noconfirm --disable-sandbox endeavouros-mirrorlist eos-base || \
             echo "eos-base has no aarch64 build yet"
           EOS
 
@@ -104,7 +107,7 @@ jobs:
           # No GPU driver for Adreno 308 exists, so the desktop has to live on
           # fbdev plus llvmpipe: xf86-video-fbdev for the panel the kernel already
           # shows (fbcon=map:1) and mesa for software GL.
-          pacman -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
+          pacman -S --noconfirm --disable-sandbox xorg-server xorg-xinit xf86-video-fbdev mesa xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
           systemctl enable lightdm
           EOS
 
