@@ -142,9 +142,12 @@ done
 # no cgroup device or pids controller, no POSIX mqueue and no autofs, and systemd
 # refuses to run without name_to_handle_at, so on this board systemd can be
 # installed and used for its tools but it cannot be init.  This script is what the
-# boot probe hands the phone over to instead: it brings up the filesystems an
-# Arch userland expects, keeps a shell on the console, and starts adbd if the
-# initramfs left the gadget for it to claim.
+# boot probe hands the phone over to instead.
+#
+# It also has to leave a way back.  Nothing here can be typed into, and if the
+# phone simply stayed up there would be no way to reach it without a button, so a
+# watchdog returns it to recovery after a quarter of an hour unless
+# /root/land-stay says the boot is being driven over adb.
 cat >"$ROOT/landinit.sh" <<'LANDINIT'
 #!/bin/sh
 PATH=/usr/bin:/usr/sbin:/bin:/sbin
@@ -152,11 +155,20 @@ mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t tmpfs tmpfs /run 2>/dev/null
 mount -t tmpfs shm /dev/shm 2>/dev/null
-mount -t configfs configfs /sys/kernel/config 2>/dev/null
 [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null
 . /etc/os-release 2>/dev/null
-echo "LANDINIT ${PRETTY_NAME:-EndeavourOS} up, kernel $(uname -r)" >/dev/console
-echo "LANDINIT packages: $(pacman -Q 2>/dev/null | wc -l)" >/dev/console
+echo "LANDINIT ${PRETTY_NAME:-EndeavourOS} up, kernel $(uname -r)" >/dev/console 2>&1
+echo "LANDINIT packages: $(pacman -Q 2>/dev/null | wc -l)" >/dev/console 2>&1
+if [ -e /root/land-stay ]; then
+	echo "LANDINIT /root/land-stay present, no automatic return to recovery" >/dev/console 2>&1
+else
+	(
+		sleep 900
+		echo recovery >/sys/reboot/cmd 2>/dev/null
+		reboot -f
+	) &
+	echo "LANDINIT returning to recovery in 15 minutes" >/dev/console 2>&1
+fi
 while :; do
 	/bin/sh </dev/console >/dev/console 2>&1
 	sleep 5
