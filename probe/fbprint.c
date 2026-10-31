@@ -27,6 +27,7 @@
 #include <unistd.h>
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #endif
 
 #if defined(__linux__) || defined(__ANDROID__)
@@ -343,14 +344,39 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (pwrite(fd, frame, framesz, (off_t) base) != (ssize_t) framesz) {
-		perror(raw ? "write raw" : "write fb");
-		rc = 1;
-	}
 	if (raw) {
+		if (pwrite(fd, frame, framesz, (off_t) base) != (ssize_t) framesz) {
+			perror("write raw");
+			rc = 1;
+		}
 		/* The caller may want to look at the result as an image. */
 		fprintf(stderr, "raw %ux%u bpp %u pitch %u, %zu bytes written\n", xres,
 			yres, bpp, pitch, framesz);
+	} else {
+		/* The mdss framebuffer has no write/pwrite file operation and answers
+		 * ENODEV to it, which is what "write fb: No such device" was: the open
+		 * and both ioctls had already succeeded.  mmap is the path the driver
+		 * actually supports, so the composed frame is copied into the mapped
+		 * buffer at the same yoffset the driver reports. */
+		size_t len = fix.smem_len;
+		void *map = NULL;
+		if (base >= len) {
+			fprintf(stderr, "fb: yoffset %zu past the %zu byte buffer\n",
+				base, len);
+			rc = 1;
+		} else {
+			if (base + framesz > len)
+				framesz = len - base;
+			map = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+			if (map == MAP_FAILED) {
+				perror("mmap fb");
+				rc = 1;
+			}
+		}
+		if (map != NULL && map != MAP_FAILED) {
+			memcpy((char *)map + base, frame, framesz);
+			munmap(map, len);
+		}
 	}
 	free(frame);
 	close(fd);
