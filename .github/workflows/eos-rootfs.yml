@@ -67,6 +67,13 @@ jobs:
             sudo mkdir -p "$ROOTF/$d" 2>/dev/null || true
           done
           sudo cp /etc/resolv.conf "$ROOTF/etc/resolv.conf"
+          # The runner resolves through a stub resolver on 127.0.0.53, which the
+          # chroot cannot reach: without a real nameserver pacman's first -Sy dies
+          # with "Could not resolve host: mirror.archlinuxarm.org".
+          if grep -q '127\.0\.0\.53' "$ROOTF/etc/resolv.conf" 2>/dev/null; then
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "$ROOTF/etc/resolv.conf" >/dev/null
+          fi
+          cat "$ROOTF/etc/resolv.conf"
           sudo mount --bind /dev "$ROOTF/dev"
           sudo mount -t proc proc "$ROOTF/proc"
           sudo mount -t sysfs sys "$ROOTF/sys"
@@ -89,15 +96,21 @@ jobs:
         if: inputs.endeavouros_repo
         run: |
           set -euo pipefail
-          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS' || echo "endeavouros repo unavailable, staying on Arch base"
-          if ! grep -q '^\[endeavouros\]' /etc/pacman.conf; then
-            printf '\n[endeavouros]\nSigLevel = PackageRequired\nServer = https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch\n' \
-              >> /etc/pacman.conf
-          fi
+          # Backed up and restored: a [endeavouros] header that cannot be reached
+          # makes every later pacman -S fail as well, because -S synchronizes all
+          # repositories.  If the repo has no aarch64 build, pacman.conf goes back
+          # exactly as it was and the root stays a plain Arch one.
+          sudo cp "$ROOTF/etc/pacman.conf" /tmp/pacman.conf.orig
+          rc=0
+          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS' || rc=$?
+          printf '\n[endeavouros]\nSigLevel = PackageRequired\nServer = https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch\n' >> /etc/pacman.conf
           pacman -Sy --noconfirm --disable-sandbox
-          pacman -S --noconfirm --disable-sandbox endeavouros-mirrorlist eos-base || \
-            echo "eos-base has no aarch64 build yet"
+          pacman -S --noconfirm --disable-sandbox endeavouros-mirrorlist eos-base
           EOS
+          if [ "$rc" != 0 ]; then
+            echo "endeavouros repo unusable for aarch64 (rc=$rc), restoring pacman.conf"
+            sudo cp /tmp/pacman.conf.orig "$ROOTF/etc/pacman.conf"
+          fi
 
       - name: Desktop on the framebuffer path
         if: inputs.desktop
