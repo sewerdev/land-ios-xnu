@@ -1,10 +1,17 @@
-# Build an aarch64 root for land (Redmi 3S) out of Arch Linux ARM, in the shape
-# EndeavourOS uses: an Arch base plus the EndeavourOS layer on top.  This runs on
-# ubuntu because the only thing that needs an arm64 binary is pacman itself, and
-# qemu-user handles that.  The macOS runners are not involved: the kernel is not
-# built here at all, we reuse the 4.19.325-Mi8937v2 Image that already boots this
-# board inside the LineageOS 18 boot image.
 name: eos-rootfs
+
+# Build an aarch64 root for land (Redmi 3S) out of Arch Linux ARM, in the shape
+# EndeavourOS uses: an Arch base, the EndeavourOS layer on top when its repo
+# answers for aarch64, packed as an ext4 image.  Nothing here needs a macOS
+# runner, and no kernel is built: mkbootcmd.py writes the matching cmdline into
+# the LineageOS 18 boot image, which already carries Linux 4.19.325-Mi8937v2 for
+# this board, and the phone mounts this root with root=/dev/mmcblk0p49.
+#
+# The root is assembled inside an arm64 container.  A chroot with qemu-user was
+# tried first and every pacman -Sy died with "Could not resolve host" even with
+# nameserver 1.1.1.1 in the guest's resolv.conf and --disable-sandbox, while the
+# same download from the runner host works: Docker gives the guest its own
+# resolver instead of relying on the host's.
 
 on:
   workflow_dispatch:
@@ -16,8 +23,8 @@ on:
         description: also install the fbdev desktop (xfce4 + llvmpipe)
         type: boolean
         default: false
-      endeavouros_repo:
-        description: add the EndeavourOS repo line to pacman.conf
+      endeavouros:
+        description: add the EndeavourOS repository
         type: boolean
         default: true
 
@@ -28,124 +35,44 @@ concurrency:
   group: eos-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  ALARM: http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
-  ROOTF: ${{ github.workspace }}/rootfs
-
 jobs:
   rootfs:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
-      - name: Unpack the Arch Linux ARM base
+      - name: Enable arm64 emulation
         run: |
           set -euo pipefail
-          curl -sSL -o alarm.tar.gz "$ALARM"
-          ls -l alarm.tar.gz
-          mkdir -p "$ROOTF"
-          # --same-owner as root: the tarball carries /dev nodes and 0700 dirs, and
-          # a plain extract would drop the device nodes we need for a chroot.
-          sudo tar -xpf alarm.tar.gz -C "$ROOTF"
-          # sudo for the listing too: the tree keeps 0700 directories (shadow,
-          # audit, ssl/private) and a plain ls under the runner account fails the
-          # step with set -e before anything is actually wrong.
-          sudo du -sh "$ROOTF"
-          sudo ls "$ROOTF"
+          # fix-binary binfmt is what lets the x86_64 kernel exec aarch64 ELF, so
+          # the container runs the real pacman rather than a cross wrapper.
+          docker run --privileged --rm tonistiigi/binfmt --install arm64
+          docker version --format '{{.Server.Version}}'
 
-      - name: Register qemu for arm64 and prepare the chroot
+      - name: Build the root inside an Arch Linux ARM container
+        env:
+          DESKTOP: ${{ inputs.desktop && '1' || '0' }}
+          EOS: ${{ inputs.endeavouros && '1' || '0' }}
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support e2fsprogs rsync
-          # binfmt with the F (fix-binary) flag is what lets an x86 kernel exec
-          # aarch64 ELF: everything below is the real pacman, not a cross wrapper.
-          docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null || \
-            sudo update-binfmts --enable qemu-aarch64
-          for d in dev proc sys etc/resolv.conf; do
-            sudo mkdir -p "$ROOTF/$d" 2>/dev/null || true
-          done
-          sudo cp /etc/resolv.conf "$ROOTF/etc/resolv.conf"
-          # The runner resolves through a stub resolver on 127.0.0.53, which the
-          # chroot cannot reach: without a real nameserver pacman's first -Sy dies
-          # with "Could not resolve host: mirror.archlinuxarm.org".
-          if grep -q '127\.0\.0\.53' "$ROOTF/etc/resolv.conf" 2>/dev/null; then
-            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee "$ROOTF/etc/resolv.conf" >/dev/null
-          fi
-          cat "$ROOTF/etc/resolv.conf"
-          sudo mount --bind /dev "$ROOTF/dev"
-          sudo mount -t proc proc "$ROOTF/proc"
-          sudo mount -t sysfs sys "$ROOTF/sys"
-
-      - name: Refresh keys and install the base
-        run: |
-          set -euo pipefail
-          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
-          # pacman 6 drops privileges to the alpm user through Landlock, and under
-          # qemu-user inside a chroot the syscall is not available: without this flag the
-          # very first -Sy dies with "switching to sandbox user 'alpm' failed".
-          # ALARM signs with its own key; the tarball's keyring is old enough that a
-          # -Syu without a keyring refresh fails on the very first transaction.
-          pacman -Sy --noconfirm --disable-sandbox archlinux-archive-keyring archlinuxarm-keyring
-          pacman-key --populate archlinux archlinuxarm
-          pacman -Syu --noconfirm --disable-sandbox
-          EOS
-
-      - name: Add the EndeavourOS layer
-        if: inputs.endeavouros_repo
-        run: |
-          set -euo pipefail
-          # Backed up and restored: a [endeavouros] header that cannot be reached
-          # makes every later pacman -S fail as well, because -S synchronizes all
-          # repositories.  If the repo has no aarch64 build, pacman.conf goes back
-          # exactly as it was and the root stays a plain Arch one.
-          sudo cp "$ROOTF/etc/pacman.conf" /tmp/pacman.conf.orig
-          rc=0
-          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS' || rc=$?
-          printf '\n[endeavouros]\nSigLevel = PackageRequired\nServer = https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch\n' >> /etc/pacman.conf
-          pacman -Sy --noconfirm --disable-sandbox
-          pacman -S --noconfirm --disable-sandbox endeavouros-mirrorlist eos-base
-          EOS
-          if [ "$rc" != 0 ]; then
-            echo "endeavouros repo unusable for aarch64 (rc=$rc), restoring pacman.conf"
-            sudo cp /tmp/pacman.conf.orig "$ROOTF/etc/pacman.conf"
-          fi
-
-      - name: Desktop on the framebuffer path
-        if: inputs.desktop
-        run: |
-          set -euo pipefail
-          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
-          # No GPU driver for Adreno 308 exists, so the desktop has to live on
-          # fbdev plus llvmpipe: xf86-video-fbdev for the panel the kernel already
-          # shows (fbcon=map:1) and mesa for software GL.
-          pacman -S --noconfirm --disable-sandbox xorg-server xorg-xinit xf86-video-fbdev mesa xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
-          systemctl enable lightdm
-          EOS
-
-      - name: Make it bootable on a test device
-        run: |
-          set -euo pipefail
-          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
-          # Empty root password and no autologin prompt: this phone is a bench
-          # device behind a framebuffer console, and typing a password into an
-          # 1 fps llvmpipe session is not a security boundary anyway.
-          passwd -d root
-          mkdir -p /etc/systemd/system/getty@tty1.service.d
-          printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %s linux\n' tty1 \
-            > /etc/systemd/system/getty@tty1.service.d/autologin.conf
-          EOS
-          sudo umount -R "$ROOTF" 2>/dev/null || true
+          mkdir -p "$RUNNER_TEMP/rootfs"
+          docker pull --platform linux/arm64 archlinuxarm/archlinux-aarch64-image
+          docker run --rm --platform linux/arm64 -e DESKTOP -e EOS \
+            -v "$RUNNER_TEMP/rootfs":/work/rootfs \
+            -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
+            archlinuxarm/archlinux-aarch64-image bash -e /work/eos/pack.sh
+          du -sh "$RUNNER_TEMP/rootfs"
+          sudo ls "$RUNNER_TEMP/rootfs"
 
       - name: Pack the ext4 image
         run: |
           set -euo pipefail
           img=$RUNNER_TEMP/eos-rootfs.img
-          # mkfs.ext4 -d copies a tree into an image without loop devices or
-          # root tricks, which is the only thing a GitHub runner reliably allows.
+          # mkfs.ext4 -d copies a tree into an image with no loop device and no
+          # mount, so nothing else in the runner has to cooperate.
           truncate -s "${{ inputs.size_gib }}G" "$img"
-          sudo mkfs.ext4 -q -L eos -d "$ROOTF" "$img"
+          sudo mkfs.ext4 -q -L eos -d "$RUNNER_TEMP/rootfs" "$img"
           ls -l "$img"
           sudo debugfs -R 'ls /' "$img" | head -3
           gzip -1 -c "$img" > "$img.gz"
