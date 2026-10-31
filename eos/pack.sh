@@ -159,25 +159,40 @@ mount -t tmpfs shm /dev/shm 2>/dev/null
 # There is no framebuffer console in this kernel, so the panel only shows what a
 # program paints on /dev/fb0.  The boot probe copies its fbprint here.
 SCR=/run/landinit-screen
+REC=/run/landinit-rec
 draw() {
 	printf '%s\n' "$@" >"$SCR" 2>/dev/null
 	if [ -e /dev/fb0 ] && [ -x /usr/local/bin/fbprint ]; then
 		/usr/local/bin/fbprint --scale 3 <"$SCR" >/dev/null 2>&1
 	fi
 }
+# A panel needs somebody standing next to the phone, and this kernel has no
+# console to log into, so the raw journal partition the boot probe already writes
+# gets one record from here as well.  Record 200 is far past anything the probe
+# writes, so neither overwrites the other.
+J=$(cat /etc/land-journal-dev 2>/dev/null)
+rec() {
+	[ -b "$J" ] || return 0
+	printf 'LANDINIT %s\n' "$*" >"$REC" 2>/dev/null
+	dd if="$REC" of="$J" bs=512 count=1 seek=200 conv=notrunc 2>/dev/null
+	sync
+}
 . /etc/os-release 2>/dev/null
 PKGS=$(pacman -Q 2>/dev/null | wc -l)
 echo "LANDINIT ${PRETTY_NAME:-EndeavourOS} up, kernel $(uname -r)" >/dev/console 2>&1
 echo "LANDINIT packages: $PKGS" >/dev/console 2>&1
 draw "EndeavourOS on land" "kernel $(uname -r)" "packages: $PKGS"
+rec "up kernel $(uname -r) packages $PKGS"
 if [ -e /root/land-stay ]; then
 	echo "LANDINIT /root/land-stay present, no automatic return to recovery" >/dev/console 2>&1
 	draw "staying up: /root/land-stay"
+	rec "staying up, /root/land-stay"
 else
 	(
 		sleep 900
 		echo recovery >/sys/reboot/cmd 2>/dev/null
 		draw "back to recovery"
+		rec "returning to recovery"
 		reboot -f
 	) &
 	echo "LANDINIT returning to recovery in 15 minutes" >/dev/console 2>&1
