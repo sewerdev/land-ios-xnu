@@ -1,0 +1,59 @@
+name: fbprint
+
+# Build the panel painter for land as a Linux aarch64 binary.
+#
+# The first fbprint was built with the Android NDK, and it has never once drawn
+# anything: bionic's startup refuses to load a static executable whose TLS segment is
+# aligned to less than 64 bytes, clang emits 8, so the process dies with SIGABRT
+# before main.  The boot probe calls it with its output swallowed, so the failure
+# showed up as nothing more than the Xiaomi logo staying on the screen.  A glibc
+# static build does not make that demand, and gcc-aarch64-linux-gnu is in Ubuntu's
+# archive, so this is the only job that can produce a binary that runs.
+#
+# It is a separate workflow rather than a step of eos-rootfs because the boot image
+# needs it and the root does not, and because a boot probe fix should not wait on a
+# six-minute pacman run.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'probe/fbprint.c'
+      - 'probe/font8x16.h'
+      - '.github/workflows/fbprint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross compiler
+        run: |
+          sudo apt-get update
+          # gcc-aarch64-linux-gnu pulls libc6-dev-arm64-cross with it, and that is
+          # where the aarch64 build finds linux/fb.h.
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          aarch64-linux-gnu-gcc -O2 -static -Wall -Wextra \
+            -I probe -o fbprint probe/fbprint.c
+          file fbprint
+
+      - name: Report what the loader will be asked to accept
+        run: |
+          # The exact check that killed the NDK build, printed here so a future
+          # toolchain change cannot silently bring it back.
+          aarch64-linux-gnu-readelf -h fbprint | grep -E 'Class|Machine|OS ABI'
+          aarch64-linux-gnu-readelf -lW fbprint | grep -E 'Type|TLS|INTERP' ||
+            echo 'no TLS segment'
+          ls -l fbprint
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fbprint-aarch64
+          path: fbprint
