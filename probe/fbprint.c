@@ -8,9 +8,9 @@
  * a boot when the phone has no keyboard, no serial cable and no adb, which is the
  * state a boot probe most needs to report from.
  *
- * The frame is composed in memory and written in one pwrite at offset 0.  fb_write
- * starts at the top of the visible buffer as long as nothing has panned it, and
- * with no console driver and no Android surface flinger there is nothing to pan it.
+ * The frame is composed in memory and written in one pwrite at the top of the
+ * visible window, which is var.yoffset rows into the buffer rather than 0 whenever a
+ * boot logo or a panning console has moved it.  fb_write starts at the same place.
  *
  * usage:
  *   fbprint [-d /dev/fb0] [--scale N] [--fg r,g,b] [--bg r,g,b] [--row N]
@@ -44,14 +44,19 @@ struct fb_bitfield {
 };
 struct fb_var_screeninfo {
 	__u32 xres, yres;
+	__u32 xres_virtual, yres_virtual;
+	__u32 xoffset, yoffset;
+	__u32 bits_per_pixel;
+	__u32 grayscale;
+	struct fb_bitfield red, green, blue, transp;
+	__u32 nonstd, activate;
+	__u32 height, width;
+	__u32 accel_flags;
+	__u32 pixclock;
 	__u32 left, right, upper, lower;
 	__u32 hsync_len, vsync_len, sync, vmode;
 	__u32 rotate;
-	struct fb_bitfield red, green, blue, transp;
-	__u32 bpp;
 	__u32 colormap;
-	__u32 pixclock;
-	__u32 hscroll;
 };
 struct fb_fix_screeninfo {
 	char id[16];
@@ -60,6 +65,7 @@ struct fb_fix_screeninfo {
 	__u32 xpanstep, ypanstep, ywrapstep;
 	__u32 line_length;
 	unsigned long mmio_start;
+	__u32 mmio_len;
 	__u32 accel;
 };
 #define FBIOGET_VSCREENINFO 0x4600
@@ -192,6 +198,7 @@ int main(int argc, char **argv)
 	unsigned int xres = 720, yres = 1280, bpp = 32, pitch = 2880;
 	unsigned char *frame;
 	size_t framesz;
+	size_t base = 0;
 
 	memset(&var, 0, sizeof(var));
 	memset(&fix, 0, sizeof(fix));
@@ -272,6 +279,10 @@ int main(int argc, char **argv)
 		yres = var.yres;
 		bpp = var.bits_per_pixel;
 		pitch = fix.line_length;
+		/* The visible window of a virtual-height framebuffer starts yoffset rows
+		 * in, and a boot logo pan does exactly that.  Writing at 0 anyway paints
+		 * above the screen, which looks identical to not having drawn at all. */
+		base = (size_t) var.yoffset * pitch;
 	}
 #endif
 	if (fd < 0)
@@ -332,7 +343,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (pwrite(fd, frame, framesz, 0) != (ssize_t) framesz) {
+	if (pwrite(fd, frame, framesz, (off_t) base) != (ssize_t) framesz) {
 		perror(raw ? "write raw" : "write fb");
 		rc = 1;
 	}
