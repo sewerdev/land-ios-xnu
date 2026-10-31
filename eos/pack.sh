@@ -21,6 +21,11 @@ set -euo pipefail
 ROOT=/work/rootfs
 EOSREPO=${EOSREPO:-https://raw.githubusercontent.com/endeavouros-team/repo/master/endeavouros/aarch64}
 
+# The imported tarball has no initialised keyring: without this the first
+# transaction dies with "keyring is not writable" / "required key missing".
+pacman-key --init
+pacman-key --populate archlinuxarm 2>/dev/null || true
+
 pacman -Sy --noconfirm --disable-sandbox arch-install-scripts >/dev/null
 
 mkdir -p "$ROOT"
