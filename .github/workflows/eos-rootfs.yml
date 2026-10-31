@@ -63,7 +63,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/rootfs"
-          docker run --rm -e DESKTOP -e EOS \
+          # seccomp=unconfined because pacman 6 drops to the alpm user through
+          # Landlock, and Docker's default profile does not let the landlock
+          # syscalls through: the run before this one died with "restricting
+          # filesystem access failed because Landlock is not supported by the
+          # kernel" on the very first pacman -Sy.
+          docker run --rm --security-opt seccomp=unconfined -e DESKTOP -e EOS \
             -v "$RUNNER_TEMP/rootfs":/work/rootfs \
             -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
             alarm-aarch64:local bash -e /work/eos/pack.sh
