@@ -149,6 +149,11 @@ fi
 # A bench phone with no keyboard: an empty root password and autologin on tty1
 # are the difference between a session and a brick, and are not a security
 # boundary in any case.
+# alpm determines free space by reading mount points, and it looks at /etc/mtab
+# first; the filesystem package does not create that link, so a pacman transaction
+# started inside this root fails before it downloads anything.
+ln -sfn /proc/mounts "$ROOT/etc/mtab"
+
 sed -i 's/^root:[^:]*/root::/' "$ROOT/etc/shadow"
 mkdir -p "$ROOT/etc/systemd/system/getty@tty1.service.d" \
          "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/run" "$ROOT/tmp"
