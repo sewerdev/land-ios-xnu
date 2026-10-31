@@ -63,7 +63,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/rootfs"
-          docker run --rm -e DESKTOP -e EOS \
+          # --privileged because pacstrap -K mounts proc, sys and dev inside the
+          # target before it installs, and an unprivileged container gets
+          # "mount: /work/rootfs/proc: permission denied" and gives up.  The
+          # seccomp profile is dropped too: it blocks the mount syscalls even
+          # with the capability present.
+          docker run --privileged --rm -e DESKTOP -e EOS \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             -v "$RUNNER_TEMP/rootfs":/work/rootfs \
             -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
             alarm-aarch64:local bash -e /work/eos/pack.sh
