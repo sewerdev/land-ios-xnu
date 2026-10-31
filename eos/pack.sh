@@ -124,6 +124,20 @@ OSR
   fi
 fi
 
+# What a distro without these is not worth booting for on a phone that has no
+# keyboard, no serial and no VT: busybox for mdev and the applets an init needs,
+# openssh in case USB networking ever comes up, an editor, a viewer, git for the
+# AUR helpers, and e2fsprogs because resize2fs has to be runnable from inside the
+# root and not only from TWRP.
+EXTRA=${EXTRA:-busybox openssh vim htop git e2fsprogs}
+for x in $EXTRA; do
+  if pm -S --noconfirm "$x"; then
+    echo "extra: $x ok"
+  else
+    echo "extra: $x failed"
+  fi
+done
+
 if [ "${DESKTOP:-0}" = 1 ]; then
   # There is no Adreno 308 driver anywhere, so the desktop is X over fbdev plus
   # llvmpipe, on the same framebuffer the kernel console already uses.
