@@ -12,22 +12,28 @@
 # again below.
 set -euo pipefail
 
+# --disable-sandbox on every transaction: pacman 6 drops to the alpm user
+# through Landlock, and qemu-user does not implement the landlock syscalls, so
+# inside an arm64 container on an x86_64 host pacman always sees "Landlock is not
+# supported by the kernel" and refuses to run at all.  Docker seccomp settings do
+# not matter here, the syscall never reaches the kernel.
+
 ROOT=/work/rootfs
 EOSREPO=${EOSREPO:-https://raw.githubusercontent.com/endeavouros-team/repo/master/endeavouros/aarch64}
 
-pacman -Sy --noconfirm arch-install-scripts >/dev/null
+pacman -Sy --noconfirm --disable-sandbox arch-install-scripts >/dev/null
 
 mkdir -p "$ROOT"
 # -K no free-space check, -c no downgrades, -d do not treat the repo's kernel as
 # a dependency to satisfy.  base is bash, coreutils, filesystem, pacman,
 # systemd, util-linux.
-pacstrap -Kcd "$ROOT" base
+pacstrap -Kcd --disable-sandbox "$ROOT" base
 
 # The ALARM image kernel is for a different board and the LOS boot image already
 # carries the kernel that will actually run, so a kernel in the root would only
 # be a claim about something that is not there.
 for k in linux linux-aarch64 linux-ck; do
-  pacman -r "$ROOT" -Rns --noconfirm "$k" >/dev/null 2>&1 || true
+  pacman -r "$ROOT" -Rns --noconfirm --disable-sandbox "$k" >/dev/null 2>&1 || true
 done
 
 if [ "${EOS:-0}" = 1 ]; then
@@ -40,18 +46,18 @@ if [ "${EOS:-0}" = 1 ]; then
   {
     printf '\n[endeavouros]\nSigLevel = Optional TrustAll\nServer = %s\n' "$EOSREPO" \
       >> "$ROOT/etc/pacman.conf"
-    pacman -r "$ROOT" -Sy --noconfirm
+    pacman -r "$ROOT" -Sy --noconfirm --disable-sandbox
     # Optional TrustAll, not PackageRequired: the .sig files in that tree are
     # made by the endeavouros key, and pulling the real keyring is the next
     # line, so the very first transaction has to be allowed to go unverified.
-    pacman -r "$ROOT" -S --noconfirm endeavouros-keyring endeavouros-mirrorlist \
+    pacman -r "$ROOT" -S --noconfirm --disable-sandbox endeavouros-keyring endeavouros-mirrorlist \
       endeavouros-branding eos-settings eos-base eos-bash-shared || true
     # Now trust the repo the way EndeavourOS does, for the packages installed
     # later on the phone.
     sed -i '/^\[endeavouros\]/,/^\[/{s/^SigLevel = .*/SigLevel = PackageRequired/}' "$ROOT/etc/pacman.conf"
     server=$(printf 'https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch')
     sed -i "/^Server = $(printf '%s' "$EOSREPO" | sed 's/[&/\]/\\&/g')/c\\Server = $server" "$ROOT/etc/pacman.conf"
-    pacman -r "$ROOT" -Sy --noconfirm
+    pacman -r "$ROOT" -Sy --noconfirm --disable-sandbox
   } || rc=$?
   if [ "$rc" != 0 ]; then
     echo "endeavouros layer failed (rc=$rc), keeping the plain Arch root"
@@ -62,7 +68,7 @@ fi
 if [ "${DESKTOP:-0}" = 1 ]; then
   # There is no Adreno 308 driver anywhere, so the desktop is X over fbdev plus
   # llvmpipe, on the same framebuffer the kernel console already uses.
-  pacman -r "$ROOT" -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa \
+  pacman -r "$ROOT" -S --noconfirm --disable-sandbox xorg-server xorg-xinit xf86-video-fbdev mesa \
     xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
   systemctl --root "$ROOT" enable lightdm
 fi
