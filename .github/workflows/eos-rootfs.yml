@@ -30,6 +30,9 @@ on:
         description: add the EndeavourOS repository
         type: boolean
         default: true
+      extra:
+        description: packages on top of the base and the EndeavourOS layer
+        default: 'busybox openssh vim htop git e2fsprogs'
 
 permissions:
   contents: read
@@ -60,6 +63,7 @@ jobs:
         env:
           DESKTOP: ${{ inputs.desktop && '1' || '0' }}
           EOS: ${{ inputs.endeavouros && '1' || '0' }}
+          EXTRA: ${{ inputs.extra }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/rootfs"
@@ -68,7 +72,7 @@ jobs:
           # "mount: /work/rootfs/proc: permission denied" and gives up.  The
           # seccomp profile is dropped too: it blocks the mount syscalls even
           # with the capability present.
-          docker run --privileged --rm -e DESKTOP -e EOS \
+          docker run --privileged --rm -e DESKTOP -e EOS -e EXTRA \
             --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             -v "$RUNNER_TEMP/rootfs":/work/rootfs \
             -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
