@@ -193,5 +193,18 @@ elif grep -q "handing the phone to the root's own init" qemu-init.log; then
 else
 	note "no landinit.sh in this root yet: rebuild it with the pack.sh that ships one"
 fi
+# The phone has no console to read afterwards, so what matters is that the root's
+# init reached the raw journal on its own, without the initramfs still around.
+"$PY" - dip.bin <<'PY'
+import sys
+d = open(sys.argv[1], 'rb').read()
+rec = d[200 * 512:200 * 512 + 512].split(b'\0')[0].decode('utf8', 'replace')
+if rec.startswith('LANDINIT up'):
+	print('PASS the root reported to the journal by itself: %s' % rec)
+	sys.exit(0)
+print('FAIL no landinit journal record (got %r)' % rec[:60])
+sys.exit(1)
+PY
+[ $? = 0 ] || fails=$((fails + 1))
 echo "TEST-QEMU-PROBE $([ $fails = 0 ] && echo ALL-OK || echo "FAILS=$fails")"
 exit "$fails"
