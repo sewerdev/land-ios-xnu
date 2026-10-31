@@ -1,7 +1,7 @@
-land: BSD block device over the SDHCI eMMC PIO reader
+land: BSD block device over the SDHCI eMMC
 
-Read-only disk on the window the ADT names (land,root-lba/-bytes), served by
-pexpert/arm/land_sdhci.c.  Boot with rd=landmmc0.
+Read-only disk over the window the ADT names (land,root-lba/-bytes), served by
+pexpert/arm/land_sdhci.c, mounted with rd=landmmc0.
 ---
 diff --git a/bsd/conf/files b/bsd/conf/files
 index c2864ab..e3be110 100644
@@ -17,10 +17,10 @@ index c2864ab..e3be110 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/land_mmc.c b/bsd/dev/land_mmc.c
 new file mode 100644
-index 0000000..fc854a5
+index 0000000..a54aa73
 --- /dev/null
 +++ b/bsd/dev/land_mmc.c
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,322 @@
 +/*
 + * land (Redmi 3S, MSM8937): read-only BSD block device over the SDHCI eMMC.
 + *
@@ -44,6 +44,7 @@ index 0000000..fc854a5
 +#include <sys/systm.h>
 +#include <sys/buf.h>
 +#include <sys/conf.h>
++#include <sys/dkio.h>
 +#include <sys/disk.h>
 +#include <sys/errno.h>
 +#include <sys/proc.h>
@@ -343,10 +344,10 @@ index 0000000..fc854a5
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index e6c74aa..e67b7b7 100644
+index 61f0890..8d949f5 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -767,6 +767,25 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -772,6 +772,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -362,8 +363,7 @@ index e6c74aa..e67b7b7 100644
 +			panic("IOFindBSDRoot: land eMMC root %s unavailable: %d", rdBootVar, mmc_error);
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
-+		IOLog("BSD root: %s, major %d, minor %d\n",
-+		    rootName, major(*root), minor(*root));
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
 +		*oflags = 0;
 +		goto iofrootx;
 +	}

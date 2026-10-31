@@ -21,6 +21,7 @@
 #include <sys/systm.h>
 #include <sys/buf.h>
 #include <sys/conf.h>
+#include <sys/dkio.h>
 #include <sys/disk.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
@@ -141,6 +142,7 @@ static int
 land_mmc_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
     __unused struct proc *p, int is_char)
 {
+	struct dk_mediainfo *mi = (struct dk_mediainfo *)data;
 	uint32_t *f = (uint32_t *)data;
 	uint64_t *o = (uint64_t *)data;
 
@@ -180,9 +182,20 @@ land_mmc_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
 		*o = 1;
 		return 0;
-	/* DKIOCGMEDIAINFO(EXT) are not in this tree's kernel headers; sweet_ufs.c
-	 * gets by without them and so does hfs, which asks block size and count. */
-
+	case DKIOCGMEDIAINFOEXT:
+		mi->dmi_media = 1;                   /* DMT_FIXED */
+		mi->dmi_flags = 0;
+		mi->dmi_block_size = lm.secsize;
+		mi->dmi_physical_block_size = MMC_BLOCK;
+		mi->dmi_bytes = lm.nblocks * MMC_BLOCK;
+		return 0;
+	case DKIOCGMEDIAINFO:
+		((struct dk_media *)data)->dmi_media = 1;
+		((struct dk_media *)data)->dmi_flags = 0;
+		((struct dk_media *)data)->dmi_block_size = lm.secsize;
+		((struct dk_media *)data)->dmi_bytes = (uint32_t)
+		    MIN(lm.nblocks * MMC_BLOCK / lm.secsize, 0xffffffffu);
+		return 0;
 	default:
 		return ENOTTY;
 	}
