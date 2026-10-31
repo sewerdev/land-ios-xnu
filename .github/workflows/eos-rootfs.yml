@@ -1,0 +1,138 @@
+# Build an aarch64 root for land (Redmi 3S) out of Arch Linux ARM, in the shape
+# EndeavourOS uses: an Arch base plus the EndeavourOS layer on top.  This runs on
+# ubuntu because the only thing that needs an arm64 binary is pacman itself, and
+# qemu-user handles that.  The macOS runners are not involved: the kernel is not
+# built here at all, we reuse the 4.19.325-Mi8937v2 Image that already boots this
+# board inside the LineageOS 18 boot image.
+name: eos-rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_gib:
+        description: ext4 image size in GiB
+        default: '6'
+      desktop:
+        description: also install the fbdev desktop (xfce4 + llvmpipe)
+        type: boolean
+        default: false
+      endeavouros_repo:
+        description: add the EndeavourOS repo line to pacman.conf
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ALARM: http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+  ROOTF: ${{ github.workspace }}/rootfs
+
+jobs:
+  rootfs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the Arch Linux ARM base
+        run: |
+          set -euo pipefail
+          curl -sSL -o alarm.tar.gz "$ALARM"
+          ls -l alarm.tar.gz
+          mkdir -p "$ROOTF"
+          # --same-owner as root: the tarball carries /dev nodes and 0700 dirs, and
+          # a plain extract would drop the device nodes we need for a chroot.
+          sudo tar -xpf alarm.tar.gz -C "$ROOTF"
+          du -sh "$ROOTF"
+          ls "$ROOTF"
+
+      - name: Register qemu for arm64 and prepare the chroot
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support e2fsprogs rsync
+          # binfmt with the F (fix-binary) flag is what lets an x86 kernel exec
+          # aarch64 ELF: everything below is the real pacman, not a cross wrapper.
+          docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null || \
+            sudo update-binfmts --enable qemu-aarch64
+          for d in dev proc sys etc/resolv.conf; do
+            sudo mkdir -p "$ROOTF/$d" 2>/dev/null || true
+          done
+          sudo cp /etc/resolv.conf "$ROOTF/etc/resolv.conf"
+          sudo mount --bind /dev "$ROOTF/dev"
+          sudo mount -t proc proc "$ROOTF/proc"
+          sudo mount -t sysfs sys "$ROOTF/sys"
+
+      - name: Refresh keys and install the base
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
+          # ALARM signs with its own key; the tarball's keyring is old enough that a
+          # -Syu without a keyring refresh fails on the very first transaction.
+          pacman -Sy --noconfirm archlinux-archive-keyring archlinuxarm-keyring
+          pacman-key --populate archlinux archlinuxarm
+          pacman -Syu --noconfirm
+          EOS
+
+      - name: Add the EndeavourOS layer
+        if: inputs.endeavouros_repo
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS' || echo "endeavouros repo unavailable, staying on Arch base"
+          if ! grep -q '^\[endeavouros\]' /etc/pacman.conf; then
+            printf '\n[endeavouros]\nSigLevel = PackageRequired\nServer = https://mirror.endeavouros.info/endeavouros/repo/endeavouros/$arch\n' \
+              >> /etc/pacman.conf
+          fi
+          pacman -Sy --noconfirm
+          pacman -S --noconfirm endeavouros-mirrorlist eos-base || \
+            echo "eos-base has no aarch64 build yet"
+          EOS
+
+      - name: Desktop on the framebuffer path
+        if: inputs.desktop
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
+          # No GPU driver for Adreno 308 exists, so the desktop has to live on
+          # fbdev plus llvmpipe: xf86-video-fbdev for the panel the kernel already
+          # shows (fbcon=map:1) and mesa for software GL.
+          pacman -S --noconfirm xorg-server xorg-xinit xf86-video-fbdev mesa xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
+          systemctl enable lightdm
+          EOS
+
+      - name: Make it bootable on a test device
+        run: |
+          set -euo pipefail
+          sudo chroot "$ROOTF" /bin/sh -eu <<'EOS'
+          # Empty root password and no autologin prompt: this phone is a bench
+          # device behind a framebuffer console, and typing a password into an
+          # 1 fps llvmpipe session is not a security boundary anyway.
+          passwd -d root
+          mkdir -p /etc/systemd/system/getty@tty1.service.d
+          printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %s linux\n' tty1 \
+            > /etc/systemd/system/getty@tty1.service.d/autologin.conf
+          EOS
+          sudo umount -R "$ROOTF" 2>/dev/null || true
+
+      - name: Pack the ext4 image
+        run: |
+          set -euo pipefail
+          img=$RUNNER_TEMP/eos-rootfs.img
+          # mkfs.ext4 -d copies a tree into an image without loop devices or
+          # root tricks, which is the only thing a GitHub runner reliably allows.
+          truncate -s "${{ inputs.size_gib }}G" "$img"
+          sudo mkfs.ext4 -q -L eos -d "$ROOTF" "$img"
+          ls -l "$img"
+          sudo debugfs -R 'ls /' "$img" | head -3
+          gzip -1 -c "$img" > "$img.gz"
+          ls -l "$img.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eos-rootfs
+          path: ${{ runner.temp }}/eos-rootfs.img.gz
