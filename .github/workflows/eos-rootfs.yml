@@ -73,7 +73,11 @@ jobs:
             -v "$RUNNER_TEMP/rootfs":/work/rootfs \
             -v "$GITHUB_WORKSPACE/eos":/work/eos:ro \
             alarm-aarch64:local bash -e /work/eos/pack.sh
-          du -sh "$RUNNER_TEMP/rootfs"
+          # sudo because the container installs the tree as root and the runner
+          # user owns the directory: an unprivileged du reports permission denied
+          # on the first few directories and exits 1, which fails the step after
+          # a perfectly good root was built.
+          sudo du -sh "$RUNNER_TEMP/rootfs"
           sudo ls "$RUNNER_TEMP/rootfs"
 
       - name: Pack the ext4 image
