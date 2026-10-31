@@ -70,5 +70,9 @@ j=$W/journal-$N.txt
 adb shell "cat /cache/land-boot-$N.log" | tr -d '\r' >"$j"
 echo "journal $j ($(grep -c '' "$j") lines)"
 grep -E '^CODE=|^uname|^cmdline|^magic|^fs:|^os-release|^packages' "$j"
+# If the root took over as pid 1, its own report is in the raw journal one record
+# past everything the probe writes.
+adb shell 'dd if=/dev/block/mmcblk0p33 bs=512 skip=200 count=1 2>/dev/null | tr -d "\000"' |
+	tr -d '\r' | sed 's/^/init-record: /'
 echo "--- dmesg tail ---"
 grep -nE 'ERROR|error|panic|Call trace|EXT4-fs|mmc|fbcon|Console' "$j" | tail -14
