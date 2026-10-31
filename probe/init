@@ -39,19 +39,6 @@ done
 SCR=$SCRDIR/scr
 : >"$SCR" 2>/dev/null
 
-PREVN=$(dd if="$JOURNALDEV" bs=512 skip=5 count=1 2>/dev/null |
-	tr -d '\000' | sed -n 's/^LANDPROBE-START n=\([0-9]*\).*/\1/p')
-[ -n "$PREVN" ] || PREVN=0
-if [ "$PREVN" -ge 3 ]; then
-	# Three boots in a row that got this far and did not finish: stop trying and
-	# leave the phone switched off, which is recoverable by a button, unlike a loop
-	# that drains the battery.
-	say "previous attempt was $PREVN, refusing to reboot again"
-	STUCK=1
-else
-	STUCK=0
-fi
-
 # This kernel has no devtmpfs (CONFIG_DEVTMPFS is not set), so the block nodes
 # have to be made here from what the mmc driver registered.  /proc/partitions is
 # readable without any /dev at all, which makes it the source of the numbers.
@@ -122,22 +109,40 @@ for n in $NODES; do
 	mknode "${n##*/}"
 done
 
-# Nothing here can be watched over a screen, so the script watches itself.  If it
-# gets stuck (a corrupted filesystem can stall a mount indefinitely) this timer bites
-# the sysrq reboot and aboot starts the probe again; the attempt counter below then
-# stops the loop after three tries.  A normal run reaches its own reboot in well
-# under a minute, so the timer never fires on purpose.
+# Whether the previous boot finished is read out of the journal itself: a boot that
+# wrote its START record and no matching handback record died somewhere in between.
+# /cache only holds a counter once a filesystem mounts, and the boot that is stuck is
+# usually exactly the one where nothing mounts, so this is the only memory a board
+# with unreadable userdata has.
+PREVSTART=$(dd if="$JOURNALDEV" bs=512 skip=5 count=1 2>/dev/null |
+	tr -d '\000' | sed -n 's/^LANDPROBE-START n=\([0-9]*\).*/\1/p')
+PREVHB=$(dd if="$JOURNALDEV" bs=512 skip=3 count=1 2>/dev/null |
+	tr -d '\000' | sed -n 's/^LANDPROBE-HB n=\([0-9]*\).*/\1/p')
+[ -n "$PREVSTART" ] || PREVSTART=0
+if [ "$PREVSTART" = "$PREVHB" ]; then
+	STUCK=0
+elif [ "$PREVSTART" -ge 3 ]; then
+	# Three starts in a row that never reached their handback: stop, because the
+	# next reboot would run this same script over the same broken filesystem.  A
+	# powered-off phone is still reachable with a button; a reboot loop is not.
+	say "attempt $PREVSTART never reached its handback, refusing to reboot again"
+	STUCK=1
+else
+	STUCK=0
+fi
+
+# Nothing here can be watched over a screen, so the script watches itself.  A mount
+# of a corrupted filesystem can go into an uninterruptible sleep, which no timeout
+# signal can kill, so this timer has to act through sysrq, from a process that is not
+# stuck.  It powers the phone off rather than rebooting it: rebooting would start this
+# same script over the same broken filesystem, and that loop drains a battery while a
+# switched-off phone still waits for one button press to reach recovery.
 (
-	# The watchdog has to outlast the longest legitimate step, which is a package
-	# download over a network that may be slow, not dead.
 	sleep $WATCHDOG
 	echo u >/proc/sysrq-trigger 2>/dev/null
-	echo b >/proc/sysrq-trigger 2>/dev/null
+	echo o >/proc/sysrq-trigger 2>/dev/null
 ) &
-
-# The attempt count is also read out of the dip record of the previous boot, because
-# that much is available even when no filesystem could be mounted: without it a probe
-# that hangs before touching /cache would reboot into itself forever.
+WD_PID=$!
 
 # /dev/fb0 is char 29:0 on any fbdev driver; mdev makes the same node from
 # /sys/class/graphics, this is only for the case where it cannot.
@@ -156,9 +161,11 @@ done
 # during a probe boot, which is why the journal goes there rather than into the
 # root being tested.
 CACHE=none
-if mount -t f2fs "$CACHEDEV" /mnt/c 2>/dev/null; then
+# timeout kills a mount that a corrupt filesystem parks in an uninterruptible sleep
+# long before the sysrq timer below has to power the phone off.
+if timeout 120 mount -t f2fs "$CACHEDEV" /mnt/c 2>/dev/null; then
 	CACHE=f2fs
-elif mount -t ext4 "$CACHEDEV" /mnt/c 2>/dev/null; then
+elif timeout 120 mount -t ext4 "$CACHEDEV" /mnt/c 2>/dev/null; then
 	CACHE=ext4
 fi
 
@@ -233,10 +240,10 @@ fi
 if [ "$DEVOK" = 1 ]; then
 	MAGIC=$(dd if="$ROOTDEV" bs=4096 count=1 2>/dev/null |
 		od -An -tx1 -j1080 -N2 | tr -d ' \n')
-	if mount -t ext4 "$ROOTDEV" /mnt/r 2>/dev/null; then
+	if timeout 120 mount -t ext4 "$ROOTDEV" /mnt/r 2>/dev/null; then
 		ROK=1
 		CODE=ROOT-MOUNTED
-	elif mount -t ext4 -o ro,noload "$ROOTDEV" /mnt/r 2>/dev/null; then
+	elif timeout 120 mount -t ext4 -o ro,noload "$ROOTDEV" /mnt/r 2>/dev/null; then
 		# The journal mkfs made is mostly zero-filled blocks, and a zero-filled
 		# block in the packed image is a hole, so what lands on the partition is
 		# whatever was there before.  noload mounts the root anyway, which is how
@@ -393,6 +400,11 @@ fi
 # inside systemd leaves no pid 1 to write the journal and no handback, so systemd
 # only gets tried once the mount itself has been read from the PC side.
 handover() { # move the API filesystems into the new root and get out of the way
+	# The sysrq timer above survives the exec, because switch_root only replaces this
+	# process and the new pid 1 inherits the orphan.  Left running, it would power the
+	# phone off in the middle of a distro that is working, so the handover cancels it
+	# and the root's own landinit.sh carries the only timer from there.
+	kill $WD_PID 2>/dev/null
 	for d in proc sys dev run tmp var/tmp sys/fs/cgroup dev/shm; do
 		mkdir -p "/mnt/r/$d" 2>/dev/null
 	done
@@ -419,6 +431,20 @@ handover() { # move the API filesystems into the new root and get out of the way
 if { [ "$TRY_INIT" = 1 ] || [ -f /mnt/c/land-init-boot ]; } && [ "$ROK" = 1 ] &&
 	[ -x /mnt/r/landinit.sh ]; then
 	say "handing the phone to the root's own init"
+	# switch_root deletes the initramfs, and the panel is only driven by fbprint,
+	# which lives here.  Without this copy the distro boots onto a black screen.
+	mkdir -p /mnt/r/usr/local/bin /mnt/r/etc 2>/dev/null
+	cp /bin/fbprint /mnt/r/usr/local/bin/fbprint 2>/dev/null
+	# After switch_root the initramfs is gone, so the root's own init has no way to
+	# know which raw partition the PC reads the verdict from.  It is not a fixed
+	# name: on the phone it is dip, under the test harness it is a virtio disk.
+	echo "$JOURNALDEV" >/mnt/r/etc/land-journal-dev 2>/dev/null
+	# One marker file on /cache has to cover both stages, so the stay flag is
+	# translated into the root before the initramfs goes away.
+	if [ -f /mnt/c/land-stay ]; then
+		mkdir -p /mnt/r/root 2>/dev/null
+		touch /mnt/r/root/land-stay
+	fi
 	handover
 	exec /sbin/switch_root /mnt/r /landinit.sh
 	say "switch_root failed, CODE=SWITCH-ROOT-FAILED"
