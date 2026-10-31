@@ -63,7 +63,10 @@ jobs:
             echo "=== $f"
             readelf -h "$f" | grep -E 'Class:|Machine:|OS/ABI'
             readelf -lW "$f" | grep -E 'Type|TLS|INTERP' || echo 'no TLS segment, no interpreter'
-            strings -a "$f" | grep -icE 'musl|BIONIC' | sed 's/^/libc marker lines: /'
+            # grep counts zero matches as a failure, and a static libc leaves no
+            # banner to find, so this line is information rather than a gate.
+            strings -a "$f" | grep -icE 'musl|BIONIC' | sed 's/^/libc marker lines: /' ||
+              echo 'libc marker lines: 0'
           done
 
       - uses: actions/upload-artifact@v4
